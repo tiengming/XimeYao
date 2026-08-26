@@ -101,27 +101,82 @@ jobs:
           if (Test-Path "target\release\resources") { Remove-Item "target\release\resources" -Recurse -Force }
           Copy-Item "resources" "target\release\resources" -Recurse
 
-      - name: Build MSI
-        shell: cmd
+      - name: Install WiX Toolset v3.14
+        shell: pwsh
+        run: |
+          $wixUrl = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix3141.exe"
+          $installer = "wix3141.exe"
+          Invoke-WebRequest -Uri $wixUrl -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/install /quiet /log wix.log" -Wait
+          # 验证安装并添加到 PATH
+          if (Test-Path "C:\Program Files (x86)\WiX Toolset v3.14\bin\candle.exe") {
+            $env:Path = "C:\Program Files (x86)\WiX Toolset v3.14\bin;$env:Path"
+            Write-Host "WiX 3.14 installed successfully."
+          } else {
+            Write-Error "WiX 3.14 installation failed or path incorrect."
+            exit 1
+          }
+
+      - name: Build MSI (PowerShell)
+        shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          set PATH=%PATH%;"C:\Program Files (x86)\WiX Toolset v3.14\bin"
-          if not exist "target\wix" mkdir "target\wix"
+          # 设置 WiX PATH
+          $wixPath = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          $env:Path = "$env:Path;$wixPath"
           
-          :: 清理旧文件，防止干扰
-          del /f /q "target\wix\*.wixobj" 2>nul
+          # 确保目标目录存在
+          if (-not (Test-Path "target\wix")) { New-Item "target\wix" -ItemType Directory -Force | Out-Null }
           
-          :: 生成 wxs 文件
-          heat dir "target\release\data" -o "crates\winxime-server\wix\data.wxs" -dr DataFolder -cg DataFiles -var var.DataDir -sreg -srd -ag
-          heat dir "target\release\resources" -o "crates\winxime-server\wix\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -var var.ResourcesDir -sreg -srd -ag
+          # 清理旧的 wixobj 文件
+          Get-ChildItem "target\wix\*.wixobj" | Remove-Item -Force -ErrorAction SilentlyContinue
           
-          :: 编译 candle: 修改 -out 参数，去掉末尾的 \
-          candle -arch x64 "crates\winxime-server\wix\main.wxs" "crates\winxime-server\wix\data.wxs" "crates\winxime-server\wix\resources.wxs" -ext WixUIExtension -ext WixUtilExtension "-dCargoTargetBinDir=target\release" "-dDataDir=target\release\data" "-dResourcesDir=target\release\resources" "-dVersion=%VERSION%" -out "target\wix"
+          # 定义路径变量
+          $dataDir = "target\release\data"
+          $resourcesDir = "target\release\resources"
+          $wixSrcDir = "crates\winxime-server\wix"
           
-          :: 链接 light: 调整参数顺序，-out 放在最前面，输入文件放在最后
-          light -out "target\wix\xime-%VERSION%.msi" -ext WixUIExtension -ext WixUtilExtension -cultures:zh-CN -loc "crates\winxime-server\wix\zh-cn.wxl" "target\wix\main.wixobj" "target\wix\data.wixobj" "target\wix\resources.wixobj"
- 
+          # 运行 heat 生成 wxs 文件
+          Write-Host "Running heat for data..."
+          & "$wixPath\heat.exe" dir $dataDir -o "$wixSrcDir\data.wxs" -dr DataFolder -cg DataFiles -sreg -srd -ag
+          
+          Write-Host "Running heat for resources..."
+          & "$wixPath\heat.exe" dir $resourcesDir -o "$wixSrcDir\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -sreg -srd -ag
+          
+          # 运行 candle 编译多个文件到目录
+          Write-Host "Running candle..."
+          & "$wixPath\candle.exe" -arch x64 `
+            "$wixSrcDir\main.wxs" `
+            "$wixSrcDir\data.wxs" `
+            "$wixSrcDir\resources.wxs" `
+            -ext WixUIExtension `
+            -ext WixUtilExtension `
+            "-dCargoTargetBinDir=target\release" `
+            "-dDataDir=$dataDir" `
+            "-dResourcesDir=$resourcesDir" `
+            "-dVersion=$env:VERSION" `
+            -out "target\wix"
+            
+          # 运行 light 链接
+          Write-Host "Running light..."
+          & "$wixPath\light.exe" `
+            -out "target\wix\xime-$env:VERSION.msi" `
+            -ext WixUIExtension `
+            -ext WixUtilExtension `
+            -cultures:zh-CN `
+            -loc "$wixSrcDir\zh-cn.wxl" `
+            "target\wix\main.wixobj" `
+            "target\wix\data.wixobj" `
+            "target\wix\resources.wixobj"
+            
+          # 检查输出
+          $msiFile = Get-ChildItem "target\wix\xime-*.msi" | Select-Object -First 1
+          if ($null -eq $msiFile) {
+            throw "MSI file not generated!"
+          }
+          Write-Host "MSI built successfully: $($msiFile.FullName)"
+          
       - name: Build MSIX
         shell: pwsh
         run: |
