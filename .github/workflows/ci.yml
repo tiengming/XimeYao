@@ -101,30 +101,62 @@ jobs:
           if (Test-Path "target\release\resources") { Remove-Item "target\release\resources" -Recurse -Force }
           Copy-Item "resources" "target\release\resources" -Recurse
 
-      - name: Install WiX Toolset v3.14
+      - name: Setup WiX Toolset
         shell: pwsh
         run: |
-          $wixUrl = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix3141.exe"
-          $installer = "wix3141.exe"
-          Invoke-WebRequest -Uri $wixUrl -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList "/install /quiet /log wix.log" -Wait
-          # 验证安装并添加到 PATH
-          if (Test-Path "C:\Program Files (x86)\WiX Toolset v3.14\bin\candle.exe") {
-            $env:Path = "C:\Program Files (x86)\WiX Toolset v3.14\bin;$env:Path"
-            Write-Host "WiX 3.14 installed successfully."
+          # 优先检查预装的 v3.11 (windows-2022 默认自带)
+          $wixPathV311 = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          $wixPathV314 = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          
+          if (Test-Path "$wixPathV311\candle.exe") {
+            Write-Host "Found pre-installed WiX Toolset v3.11 at $wixPathV311"
+            $env:WIX_PATH = $wixPathV311
+          } elseif (Test-Path "$wixPathV314\candle.exe") {
+            Write-Host "Found WiX Toolset v3.14 at $wixPathV314"
+            $env:WIX_PATH = $wixPathV314
           } else {
-            Write-Error "WiX 3.14 installation failed or path incorrect."
-            exit 1
+            Write-Host "WiX Toolset not found. Attempting to install v3.14..."
+            # 仅在找不到时尝试安装，增加超时和重试
+            $wixUrl = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix3141.exe"
+            $installer = "wix3141.exe"
+            try {
+              Invoke-WebRequest -Uri $wixUrl -OutFile $installer -TimeoutSec 60
+              Start-Process -FilePath $installer -ArgumentList "/install /quiet /norestart /log wix_install.log" -Wait
+              Remove-Item $installer -Force
+              if (Test-Path "$wixPathV314\candle.exe") {
+                $env:WIX_PATH = $wixPathV314
+                Write-Host "WiX Toolset v3.14 installed successfully."
+              } else {
+                throw "WiX Toolset v3.14 installation failed or path incorrect."
+              }
+            } catch {
+              Write-Error "Failed to download or install WiX Toolset: $_"
+              exit 1
+            }
           }
+          
+          # 添加到 PATH
+          $env:Path = "$env:WIX_PATH;$env:Path"
+          Write-Host "WiX PATH set to: $env:WIX_PATH"
 
       - name: Build MSI (PowerShell)
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # 设置 WiX 路径
-          $wixPath = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
-          $env:Path = "$env:Path;$wixPath"
+          # 使用动态获取的 WIX_PATH，而不是硬编码
+          $wixPath = $env:WIX_PATH
+          if (-not $wixPath) {
+            # 回退检查
+            if (Test-Path "C:\Program Files (x86)\WiX Toolset v3.11\bin\candle.exe") {
+              $wixPath = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+            } else {
+              throw "WiX Toolset path not found in environment!"
+            }
+          }
+          
+          Write-Host "Using WiX Toolset from: $wixPath"
+          $env:Path = "$wixPath;$env:Path"
           
           # 确保目标目录存在
           if (-not (Test-Path "target\wix")) { New-Item "target\wix" -ItemType Directory -Force | Out-Null }
@@ -132,7 +164,7 @@ jobs:
           # 清理旧的 wixobj 文件
           Get-ChildItem "target\wix\*.wixobj" | Remove-Item -Force -ErrorAction SilentlyContinue
           
-          # 定义绝对路径变量 (增强稳定性)
+          # 定义绝对路径变量
           $dataDir = (Resolve-Path "target\release\data").Path
           $resourcesDir = (Resolve-Path "target\release\resources").Path
           $wixSrcDir = (Resolve-Path "crates\winxime-server\wix").Path
@@ -140,13 +172,13 @@ jobs:
           # 运行 heat 生成 wxs 文件 (关键修复：添加 -var 参数)
           Write-Host "Running heat for data..."
           & "$wixPath\heat.exe" dir $dataDir -o "$wixSrcDir\data.wxs" -dr DataFolder -cg DataFiles -sreg -srd -ag -var var.DataDir
-          if ($LASTEXITCODE -ne 0) { throw "Heat data failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Heat data failed with code $LASTEXITCODE" }
           
           Write-Host "Running heat for resources..."
           & "$wixPath\heat.exe" dir $resourcesDir -o "$wixSrcDir\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -sreg -srd -ag -var var.ResourcesDir
-          if ($LASTEXITCODE -ne 0) { throw "Heat resources failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Heat resources failed with code $LASTEXITCODE" }
           
-          # 运行 candle 编译多个文件到目录 (关键修复：-out 路径必须以 \ 结尾)
+          # 运行 candle 编译 (关键修复：-out 路径必须以 \ 结尾)
           Write-Host "Running candle..."
           & "$wixPath\candle.exe" -arch x64 `
             "$wixSrcDir\main.wxs" `
@@ -158,9 +190,13 @@ jobs:
             "-dDataDir=$dataDir" `
             "-dResourcesDir=$resourcesDir" `
             "-dVersion=$env:VERSION" `
-            -out "target\wix\"  # <-- 强制添加反斜杠
+            -out "target\wix\"
           
-          if ($LASTEXITCODE -ne 0) { throw "Candle compilation failed" }
+          if ($LASTEXITCODE -ne 0) { 
+            Write-Error "Candle failed with code $LASTEXITCODE"
+            Get-Content "target\wix\*.log" -ErrorAction SilentlyContinue
+            throw "Candle compilation failed" 
+          }
             
           # 运行 light 链接
           Write-Host "Running light..."
@@ -174,7 +210,10 @@ jobs:
             "target\wix\data.wixobj" `
             "target\wix\resources.wixobj"
           
-          if ($LASTEXITCODE -ne 0) { throw "Light linking failed" }
+          if ($LASTEXITCODE -ne 0) { 
+            Write-Error "Light failed with code $LASTEXITCODE"
+            throw "Light linking failed" 
+          }
             
           # 检查输出
           $msiFile = Get-ChildItem "target\wix\xime-*.msi" | Select-Object -First 1
@@ -182,59 +221,100 @@ jobs:
             throw "MSI file not generated despite successful exit codes!"
           }
           Write-Host "MSI built successfully: $($msiFile.FullName)"
-
       - name: Build MSIX
         shell: pwsh
         run: |
+          # 1. 获取并校验版本号
           $ver = "${{ steps.version.outputs.version }}"
-          $parts = $ver.Split('.')
-          $msixVersion = "$($parts[0]).$($parts[1]).$($parts[2]).0"
+          Write-Host "Detected version: $ver"
           
+          $parts = $ver.Split('.')
+          if ($parts.Count -lt 3) {
+            Write-Error "Version '$ver' is invalid. Expected at least X.Y.Z format."
+            exit 1
+          }
+          
+          # 转换为 MSIX 格式 (X.Y.Z.0)
+          $msixVersion = "$($parts[0]).$($parts[1]).$($parts[2]).0"
+          Write-Host "MSIX Version: $msixVersion"
+          
+          # 2. 准备打包目录
           $packageDir = "target\msix-pkg"
           if (Test-Path $packageDir) { Remove-Item $packageDir -Recurse -Force }
           New-Item "$packageDir\assets", "$packageDir\data", "$packageDir\resources" -ItemType Directory -Force | Out-Null
           
-          # binaries
-          Copy-Item "target\release\winxime-server.exe", "target\release\winxime_tsf.dll", "target\release\winxime-setup.exe", "target\release\winxime-tsf-register.exe", "target\release\rime.dll" $packageDir
+          # 3. 复制文件 (使用绝对路径源)
+          $binDir = (Resolve-Path "target\release").Path
+          $dataDir = (Resolve-Path "target\release\data").Path
+          $resDir = (Resolve-Path "target\release\resources").Path
+          $manifestSrc = (Resolve-Path "crates\winxime-server\msix\AppxManifest.xml").Path
+          $assetsSrc = (Resolve-Path "crates\winxime-server\msix\assets").Path
           
-          # data & resources
-          Copy-Item "target\release\data\*" "$packageDir\data" -Recurse -Force
-          Copy-Item "target\release\resources\*" "$packageDir\resources" -Recurse -Force
+          Write-Host "Copying binaries..."
+          Copy-Item "$binDir\winxime-server.exe", "$binDir\winxime_tsf.dll", "$binDir\winxime-setup.exe", "$binDir\winxime-tsf-register.exe", "$binDir\rime.dll" $packageDir -Force
           
-          # logos & manifest
-          Copy-Item "crates\winxime-server\msix\assets\*" "$packageDir\assets"
-          $manifest = Get-Content "crates\winxime-server\msix\AppxManifest.xml" -Raw -Encoding UTF8
+          Write-Host "Copying data & resources..."
+          Copy-Item "$dataDir\*" "$packageDir\data" -Recurse -Force
+          Copy-Item "$resDir\*" "$packageDir\resources" -Recurse -Force
+          
+          Write-Host "Copying assets..."
+          Copy-Item "$assetsSrc\*" "$packageDir\assets" -Recurse -Force
+          
+          # 4. 处理 AppxManifest.xml
+          Write-Host "Injecting version into AppxManifest.xml..."
+          $manifest = Get-Content $manifestSrc -Raw -Encoding UTF8
           $manifest = $manifest.Replace('{{VERSION}}', $msixVersion)
+          
+          # 写入带 BOM 的 UTF-8 (MakeAppx 有时对无 BOM 的 UTF-8 敏感)
           $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-          [System.IO.File]::WriteAllText("$packageDir\AppxManifest.xml", $manifest, $utf8Bom)
+          $manifestDest = Join-Path $packageDir "AppxManifest.xml"
+          [System.IO.File]::WriteAllText($manifestDest, $manifest, $utf8Bom)
           
+          # 5. 查找 MakeAppx.exe (确保找到最新版本)
           $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          if (-not (Test-Path $kitRoot)) {
+            Write-Error "Windows Kits not found at $kitRoot. MakeAppx cannot run."
+            exit 1
+          }
+          
           $makeAppx = Get-ChildItem "$kitRoot\*\x64\MakeAppx.exe" | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $makeAppx) { Write-Error "MakeAppx.exe not found"; exit 1 }
+          if (-not $makeAppx) {
+            Write-Error "MakeAppx.exe not found in $kitRoot. Ensure Windows SDK is installed."
+            exit 1
+          }
+          Write-Host "Using MakeAppx: $makeAppx"
           
-          if (-not (Test-Path "target\wix")) { New-Item "target\wix" -ItemType Directory -Force | Out-Null }
-          
-          # 使用绝对路径增强稳定性
+          # 6. 执行打包 (关键：使用绝对路径)
           $absPackageDir = (Resolve-Path $packageDir).Path
-          $outputMsix = "target\wix\xime-$ver-x86_64.msix"
-          $absOutputMsix = (Resolve-Path "target\wix").Path + "\xime-$ver-x86_64.msix"
+          $outputFileName = "xime-$ver-x86_64.msix"
+          $outputDir = (Resolve-Path "target\wix").Path
           
-          Write-Host "Packaging MSIX from $absPackageDir to $absOutputMsix"
-          & $makeAppx pack /d $absPackageDir /p $absOutputMsix /l
+          if (-not (Test-Path $outputDir)) {
+            New-Item $outputDir -ItemType Directory -Force | Out-Null
+          }
           
+          $absOutputPath = Join-Path $outputDir $outputFileName
+          
+          Write-Host "Packaging MSIX from '$absPackageDir' to '$absOutputPath'..."
+          
+          & $makeAppx pack /d $absPackageDir /p $absOutputPath /l
+          
+          # 7. 显式检查退出码
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "MakeAppx failed with exit code $LASTEXITCODE"
+            Write-Error "MakeAppx failed with exit code $LASTEXITCODE. Check the log above for details."
             exit 1
           }
           
-          if (-not (Test-Path $absOutputMsix)) {
-            Write-Error "MSIX file not generated at expected path: $absOutputMsix"
+          # 8. 最终验证文件是否存在
+          if (-not (Test-Path $absOutputPath)) {
+            Write-Error "MSIX file was not generated at expected path: $absOutputPath"
             exit 1
           }
           
-          Write-Host "MSIX Package built successfully: $absOutputMsix"
+          Write-Host "MSIX Package built successfully: $absOutputPath"
+          
+          # 9. 清理临时目录
           Remove-Item $packageDir -Recurse -Force
-
       - name: Upload MSI (Unsigned)
         id: upload-msi
         uses: actions/upload-artifact@v4
