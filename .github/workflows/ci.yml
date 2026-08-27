@@ -122,7 +122,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # 设置 WiX PATH
+          # 设置 WiX 路径
           $wixPath = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
           $env:Path = "$env:Path;$wixPath"
           
@@ -132,19 +132,21 @@ jobs:
           # 清理旧的 wixobj 文件
           Get-ChildItem "target\wix\*.wixobj" | Remove-Item -Force -ErrorAction SilentlyContinue
           
-          # 定义路径变量
-          $dataDir = "target\release\data"
-          $resourcesDir = "target\release\resources"
-          $wixSrcDir = "crates\winxime-server\wix"
+          # 定义绝对路径变量 (增强稳定性)
+          $dataDir = (Resolve-Path "target\release\data").Path
+          $resourcesDir = (Resolve-Path "target\release\resources").Path
+          $wixSrcDir = (Resolve-Path "crates\winxime-server\wix").Path
           
-          # 运行 heat 生成 wxs 文件
+          # 运行 heat 生成 wxs 文件 (关键修复：添加 -var 参数)
           Write-Host "Running heat for data..."
-          & "$wixPath\heat.exe" dir $dataDir -o "$wixSrcDir\data.wxs" -dr DataFolder -cg DataFiles -sreg -srd -ag
+          & "$wixPath\heat.exe" dir $dataDir -o "$wixSrcDir\data.wxs" -dr DataFolder -cg DataFiles -sreg -srd -ag -var var.DataDir
+          if ($LASTEXITCODE -ne 0) { throw "Heat data failed" }
           
           Write-Host "Running heat for resources..."
-          & "$wixPath\heat.exe" dir $resourcesDir -o "$wixSrcDir\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -sreg -srd -ag
+          & "$wixPath\heat.exe" dir $resourcesDir -o "$wixSrcDir\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -sreg -srd -ag -var var.ResourcesDir
+          if ($LASTEXITCODE -ne 0) { throw "Heat resources failed" }
           
-          # 运行 candle 编译多个文件到目录
+          # 运行 candle 编译多个文件到目录 (关键修复：-out 路径必须以 \ 结尾)
           Write-Host "Running candle..."
           & "$wixPath\candle.exe" -arch x64 `
             "$wixSrcDir\main.wxs" `
@@ -156,7 +158,9 @@ jobs:
             "-dDataDir=$dataDir" `
             "-dResourcesDir=$resourcesDir" `
             "-dVersion=$env:VERSION" `
-            -out "target\wix"
+            -out "target\wix\"  # <-- 强制添加反斜杠
+          
+          if ($LASTEXITCODE -ne 0) { throw "Candle compilation failed" }
             
           # 运行 light 链接
           Write-Host "Running light..."
@@ -169,45 +173,66 @@ jobs:
             "target\wix\main.wixobj" `
             "target\wix\data.wixobj" `
             "target\wix\resources.wixobj"
+          
+          if ($LASTEXITCODE -ne 0) { throw "Light linking failed" }
             
           # 检查输出
           $msiFile = Get-ChildItem "target\wix\xime-*.msi" | Select-Object -First 1
           if ($null -eq $msiFile) {
-            throw "MSI file not generated!"
+            throw "MSI file not generated despite successful exit codes!"
           }
           Write-Host "MSI built successfully: $($msiFile.FullName)"
-          
+
       - name: Build MSIX
         shell: pwsh
         run: |
           $ver = "${{ steps.version.outputs.version }}"
           $parts = $ver.Split('.')
           $msixVersion = "$($parts[0]).$($parts[1]).$($parts[2]).0"
-
+          
           $packageDir = "target\msix-pkg"
           if (Test-Path $packageDir) { Remove-Item $packageDir -Recurse -Force }
           New-Item "$packageDir\assets", "$packageDir\data", "$packageDir\resources" -ItemType Directory -Force | Out-Null
-
+          
           # binaries
           Copy-Item "target\release\winxime-server.exe", "target\release\winxime_tsf.dll", "target\release\winxime-setup.exe", "target\release\winxime-tsf-register.exe", "target\release\rime.dll" $packageDir
-
+          
           # data & resources
           Copy-Item "target\release\data\*" "$packageDir\data" -Recurse -Force
           Copy-Item "target\release\resources\*" "$packageDir\resources" -Recurse -Force
-
+          
           # logos & manifest
           Copy-Item "crates\winxime-server\msix\assets\*" "$packageDir\assets"
           $manifest = Get-Content "crates\winxime-server\msix\AppxManifest.xml" -Raw -Encoding UTF8
           $manifest = $manifest.Replace('{{VERSION}}', $msixVersion)
           $utf8Bom = New-Object System.Text.UTF8Encoding($true)
           [System.IO.File]::WriteAllText("$packageDir\AppxManifest.xml", $manifest, $utf8Bom)
-
+          
           $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
           $makeAppx = Get-ChildItem "$kitRoot\*\x64\MakeAppx.exe" | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $makeAppx) { Write-Error "MakeAppx.exe not found"; exit 1 }
-
+          
           if (-not (Test-Path "target\wix")) { New-Item "target\wix" -ItemType Directory -Force | Out-Null }
-          & $makeAppx pack /d $packageDir /p "target\wix\xime-$ver-x86_64.msix" /l
+          
+          # 使用绝对路径增强稳定性
+          $absPackageDir = (Resolve-Path $packageDir).Path
+          $outputMsix = "target\wix\xime-$ver-x86_64.msix"
+          $absOutputMsix = (Resolve-Path "target\wix").Path + "\xime-$ver-x86_64.msix"
+          
+          Write-Host "Packaging MSIX from $absPackageDir to $absOutputMsix"
+          & $makeAppx pack /d $absPackageDir /p $absOutputMsix /l
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "MakeAppx failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          
+          if (-not (Test-Path $absOutputMsix)) {
+            Write-Error "MSIX file not generated at expected path: $absOutputMsix"
+            exit 1
+          }
+          
+          Write-Host "MSIX Package built successfully: $absOutputMsix"
           Remove-Item $packageDir -Recurse -Force
 
       - name: Upload MSI (Unsigned)
