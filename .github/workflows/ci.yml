@@ -104,27 +104,30 @@ jobs:
       - name: Setup WiX Toolset
         shell: pwsh
         run: |
-          # 优先检查预装的 v3.11 (windows-2022 默认自带)
+          # 定义常见路径
           $wixPathV311 = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
           $wixPathV314 = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
           
+          # 优先检查预装的 v3.11 (windows-2022 默认自带)
           if (Test-Path "$wixPathV311\candle.exe") {
             Write-Host "Found pre-installed WiX Toolset v3.11 at $wixPathV311"
-            $env:WIX_PATH = $wixPathV311
-          } elseif (Test-Path "$wixPathV314\candle.exe") {
+            $wixPath = $wixPathV311
+          } 
+          elseif (Test-Path "$wixPathV314\candle.exe") {
             Write-Host "Found WiX Toolset v3.14 at $wixPathV314"
-            $env:WIX_PATH = $wixPathV314
-          } else {
+            $wixPath = $wixPathV314
+          } 
+          else {
             Write-Host "WiX Toolset not found. Attempting to install v3.14..."
-            # 仅在找不到时尝试安装，增加超时和重试
             $wixUrl = "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix3141.exe"
             $installer = "wix3141.exe"
             try {
               Invoke-WebRequest -Uri $wixUrl -OutFile $installer -TimeoutSec 60
               Start-Process -FilePath $installer -ArgumentList "/install /quiet /norestart /log wix_install.log" -Wait
               Remove-Item $installer -Force
+              
               if (Test-Path "$wixPathV314\candle.exe") {
-                $env:WIX_PATH = $wixPathV314
+                $wixPath = $wixPathV314
                 Write-Host "WiX Toolset v3.14 installed successfully."
               } else {
                 throw "WiX Toolset v3.14 installation failed or path incorrect."
@@ -135,28 +138,32 @@ jobs:
             }
           }
           
-          # 添加到 PATH
-          $env:Path = "$env:WIX_PATH;$env:Path"
-          Write-Host "WiX PATH set to: $env:WIX_PATH"
-
+          # 关键修复：将路径添加到 Path 环境变量，并确保后续步骤能访问
+          $env:Path = "$wixPath;$env:Path"
+          
+          # 验证 PATH 是否包含 WiX
+          Write-Host "Updated PATH includes: $wixPath"
+          Write-Host "Checking for candle.exe in PATH..."
+          $candleExe = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if ($null -eq $candleExe) {
+            Write-Error "candle.exe not found in updated PATH!"
+            exit 1
+          }
+          Write-Host "Verified candle.exe at: $($candleExe.Source)"
       - name: Build MSI (PowerShell)
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # 使用动态获取的 WIX_PATH，而不是硬编码
-          $wixPath = $env:WIX_PATH
+          # 关键修复：不再依赖 $env:WIX_PATH，直接通过 PATH 查找
+          $wixPath = (Get-Command candle.exe).Source | Split-Path
+          
           if (-not $wixPath) {
-            # 回退检查
-            if (Test-Path "C:\Program Files (x86)\WiX Toolset v3.11\bin\candle.exe") {
-              $wixPath = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
-            } else {
-              throw "WiX Toolset path not found in environment!"
-            }
+            Write-Error "WiX Toolset not found in PATH!"
+            exit 1
           }
           
           Write-Host "Using WiX Toolset from: $wixPath"
-          $env:Path = "$wixPath;$env:Path"
           
           # 确保目标目录存在
           if (-not (Test-Path "target\wix")) { New-Item "target\wix" -ItemType Directory -Force | Out-Null }
@@ -169,7 +176,7 @@ jobs:
           $resourcesDir = (Resolve-Path "target\release\resources").Path
           $wixSrcDir = (Resolve-Path "crates\winxime-server\wix").Path
           
-          # 运行 heat 生成 wxs 文件 (关键修复：添加 -var 参数)
+          # 运行 heat 生成 wxs 文件
           Write-Host "Running heat for data..."
           & "$wixPath\heat.exe" dir $dataDir -o "$wixSrcDir\data.wxs" -dr DataFolder -cg DataFiles -sreg -srd -ag -var var.DataDir
           if ($LASTEXITCODE -ne 0) { throw "Heat data failed with code $LASTEXITCODE" }
@@ -178,7 +185,7 @@ jobs:
           & "$wixPath\heat.exe" dir $resourcesDir -o "$wixSrcDir\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -sreg -srd -ag -var var.ResourcesDir
           if ($LASTEXITCODE -ne 0) { throw "Heat resources failed with code $LASTEXITCODE" }
           
-          # 运行 candle 编译 (关键修复：-out 路径必须以 \ 结尾)
+          # 运行 candle 编译
           Write-Host "Running candle..."
           & "$wixPath\candle.exe" -arch x64 `
             "$wixSrcDir\main.wxs" `
