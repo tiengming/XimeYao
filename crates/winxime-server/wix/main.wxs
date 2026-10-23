@@ -180,9 +180,6 @@
                             Name='XimeServer' Type='string' Value='[APPLICATIONFOLDER]winxime-server.exe' KeyPath='yes'/>
                     </Component>
                     
-                    <!-- Data folder: rime base data (harvested by heat) -->
-                    <Directory Id='DataFolder' Name='data'/>
-                    
                     <!-- User-data folder: schema files for first-run deploy (harvested by heat) -->
                     <Directory Id='UserDataFolder' Name='user-data'/>
                     
@@ -236,7 +233,7 @@
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs all binaries and data.'
+            Description='Installs all binaries, user data and resources.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
@@ -248,15 +245,22 @@
             <ComponentRef Id='binary2'/>
             <ComponentRef Id='tsf_dll'/>
             <ComponentRef Id='rime_dll'/>
+            <!-- 语音运行库：server 导入表直接引用，必须随包安装。
+                 CUDA EP 只在 GPU 包里存在，跟着同一个开关引用，否则 light
+                 会报 ICE21（Component does not belong to any Feature）。 -->
+            <ComponentRef Id='sherpa_dll'/>
+            <ComponentRef Id='sherpa_cxx_dll'/>
+            <ComponentRef Id='onnxruntime_dll'/>
+            <ComponentRef Id='onnxruntime_providers_dll'/>
+            <?if $(var.WithCudaDlls) = 1 ?>
+            <ComponentRef Id='onnxruntime_cuda_dll'/>
+            <?endif?>
             <ComponentRef Id='icon_file'/>
             <ComponentRef Id='RunStartup'/>
             <ComponentRef Id='ApplicationShortcut'/>
         </Feature>
         
-        <!-- Include harvested data and resources -->
-        <Feature Id='DataFiles' Level='1'>
-            <ComponentGroupRef Id='DataFiles'/>
-        </Feature>
+        <!-- Include harvested user-data and resources -->
         <Feature Id='UserDataFiles' Level='1'>
             <ComponentGroupRef Id='UserDataFiles'/>
         </Feature>

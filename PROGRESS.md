@@ -2930,3 +2930,34 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
    仍待用户目视/真机验证。
 6. **`libximecore` 改动需各端回归**：配置 save/load 语义（差异写入 + 树合并）是共用核心，
    Android/Linux/macOS 客户端需验证「改设置 → 保存 → 重开」与恢复/撤销按钮。
+
+### 2026-10-23 修复 CI：MSI 打包 light ICE21（语音运行库没挂 Feature）
+
+- **现象**：PR #22 及合并后的 main 都在「Build MSI」步骤失败，`light` 返回 204：
+  `ICE21: Component: 'sherpa_dll' / 'sherpa_cxx_dll' / 'onnxruntime_dll' /
+  'onnxruntime_providers_dll' does not belong to any Feature`。
+- **根因**：347e083 为语音（sherpa-onnx）新增了这 4 个 Component，但只定义了
+  `<Component>`，漏了 Binaries Feature 里的 `<ComponentRef>`。此前 CI 在更早的
+  `cargo build`（libximecore `voice` 模块 cfg 问题）就挂了，MSI 这层错误一直没暴露。
+- **修复**：`crates/winxime-server/wix/main.wxs` 的 Binaries Feature 补上 4 个
+  ComponentRef；GPU 包专用的 `onnxruntime_cuda_dll` 放进 `WithCudaDlls` 条件引用，
+  避免 CPU 包引用不存在的组件。
+- **验证**：静态检查 13 个 Component / 13 个 ComponentRef，无未引用组件、无悬空引用；
+  本机是 Linux（无 WiX/light），实际打包需以 Windows CI 结果为准。
+- **工作流同步修复**（`ci.yml`）：
+  - MSIX 步骤漏拷语音运行库（`sherpa-onnx-c-api.dll` / `onnxruntime.dll` 等），
+    打出的包装完 server 起不来；已对齐 `msix-bundle.ps1`，缺 mandatory DLL 直接失败。
+  - CI 的 `data/` 仍夹带 librime minimal 示例、方案文件同时写进 data 和 user-data；
+    已对齐 `msi-build.ps1` / `msix-bundle.ps1`：rime-wubi 只进 `user-data/`。
+  - **实测补充（workflow_dispatch 首跑）**：`data/` 置空后 `heat` 报 HEAT5053
+    （empty directories are not being kept）且**不覆盖**仓库里旧的 `data.wxs`，
+    `light` 随后拿旧清单报几十个 LGHT0103。`data/` 按设计本就不分发任何文件，
+    因此彻底移除 DataFiles：删 `data.wxs`、`main.wxs` 去掉 `DataFolder`/`DataFiles`，
+    `ci.yml` / `msi-build.ps1` 不再 heat data、candle/light 不再传 `data.wxs`；
+    `msix-bundle.ps1` 也不再创建空的 package/data。heat 失败改为显式退出。
+  - 增加 `workflow_dispatch`，未开 PR 的 feature 分支也能手动跑完整打包链路。
+- **CI 验证（run 39964368057，2026-10-23）**：Build release / Build MSI / Build MSIX /
+  两个 Upload 步骤全绿。产物抽检（下载 artifact）：
+  - MSI：43 个文件，含 `onnxruntime.dll` / `onnxruntime_providers_shared.dll` /
+    `sherpa-onnx-c-api.dll` / `sherpa-onnx-cxx-api.dll`，无 `data/*.yaml|bin`；
+  - MSIX：48 个文件，含上述 4 个语音 DLL + 21 个 `user-data/` 文件，无 `data/`。

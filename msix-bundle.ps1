@@ -53,7 +53,6 @@ if (Test-Path $packageDir) {
 }
 
 New-Item "$packageDir\assets" -ItemType Directory -Force | Out-Null
-New-Item "$packageDir\data" -ItemType Directory -Force | Out-Null
 New-Item "$packageDir\resources" -ItemType Directory -Force | Out-Null
 
 # 1. Copy binaries
@@ -103,12 +102,9 @@ foreach ($dll in $optionalDlls) {
     if (Test-Path $srcDll) { Copy-Item $srcDll $packageDir }
 }
 
-# 2. data/ 不再分发 librime 自带 minimal 示例（librime\data\minimal：
-#    cangjie5 / luna_pinyin / essay.txt 等示例方案与语料，会混入用户 rime
+# 2. data/ 不再分发（librime\data\minimal 的示例方案与语料会混入用户 rime
 #    目录）。rime-wubi（user-data/）自包含全部所需文件（default.yaml /
-#    symbols.yaml 均有）。清空旧暂存，防止历史残留被 ensure_rime_data 拷入。
-Write-Host "Step 2: Clearing staged data (librime minimal samples no longer shipped)..." -ForegroundColor Yellow
-Remove-Item "$packageDir\data\*" -Recurse -Force -ErrorAction SilentlyContinue
+#    symbols.yaml 均有），server 的 ensure_rime_data 会跳过不存在的 data/。
 
 # 3. Copy rime-wubi data (to user-data/, deployed to %APPDATA% on first run)
 Write-Host "Step 3: Copying rime-wubi data..." -ForegroundColor Yellow
