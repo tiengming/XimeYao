@@ -100,12 +100,9 @@ if (Test-Path $rimeDll) {
     Write-Warning "rime.dll not found at $rimeDll"
 }
 
-# 2. data/ 不再分发 librime 自带 minimal 示例（cangjie5 / luna_pinyin /
-#    essay.txt 等会混入用户 rime 目录）；rime-wubi（user-data/）自包含。
-if (Test-Path "$TargetDir\data") {
-    Remove-Item "$TargetDir\data" -Recurse -Force
-}
-New-Item "$TargetDir\data" -ItemType Directory -Force | Out-Null
+# 2. 不再分发 librime 自带 minimal 示例（cangjie5 / luna_pinyin / essay.txt
+#    等会混入用户 rime 目录）；rime-wubi（user-data/）自包含。data/ 已从
+#    WiX 里移除（空目录会让 heat 报 HEAT5053，并留下旧的 data.wxs 被 light 误用）。
 
 # 2.5. Copy user schema files (to user-data/, deployed to %APPDATA% on first run)
 Write-Host "Step 2.5: Copying user schema files..." -ForegroundColor Yellow
@@ -145,11 +142,18 @@ if (Test-Path "$TargetDir\resources") {
 }
 Copy-Item "resources" "$TargetDir\resources" -Recurse
 
-# 4. Harvest data, user-data, and resources
-Write-Host "Step 4: Harvesting data and resources..." -ForegroundColor Yellow
-heat dir "$TargetDir\data" -o "crates\winxime-server\wix\data.wxs" -dr DataFolder -cg DataFiles -var var.DataDir -sreg -srd -ag
+# 4. Harvest user-data and resources
+Write-Host "Step 4: Harvesting user-data and resources..." -ForegroundColor Yellow
 heat dir "$TargetDir\user-data" -o "crates\winxime-server\wix\userdata.wxs" -dr UserDataFolder -cg UserDataFiles -var var.UserDataDir -sreg -srd -ag
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "heat (user-data) failed!" -ForegroundColor Red
+    exit 1
+}
 heat dir "$TargetDir\resources" -o "crates\winxime-server\wix\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -var var.ResourcesDir -sreg -srd -ag
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "heat (resources) failed!" -ForegroundColor Red
+    exit 1
+}
 
 # 5. Compile with candle
 Write-Host "Step 5: Compiling WiX sources..." -ForegroundColor Yellow
@@ -157,10 +161,9 @@ if (-not (Test-Path "target\wix")) {
     New-Item "target\wix" -ItemType Directory -Force | Out-Null
 }
 
-candle -arch x64 "crates\winxime-server\wix\main.wxs" "crates\winxime-server\wix\data.wxs" "crates\winxime-server\wix\userdata.wxs" "crates\winxime-server\wix\resources.wxs" `
+candle -arch x64 "crates\winxime-server\wix\main.wxs" "crates\winxime-server\wix\userdata.wxs" "crates\winxime-server\wix\resources.wxs" `
     -ext WixUIExtension -ext WixUtilExtension `
     "-dCargoTargetBinDir=$TargetDir" `
-    "-dDataDir=$TargetDir\data" `
     "-dUserDataDir=$TargetDir\user-data" `
     "-dResourcesDir=$TargetDir\resources" `
     "-dWithCudaDlls=$WithCudaDlls" `
@@ -174,7 +177,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # 6. Link with light
 Write-Host "Step 6: Linking MSI..." -ForegroundColor Yellow
-light "target\wix\main.wixobj" "target\wix\data.wixobj" "target\wix\userdata.wixobj" "target\wix\resources.wixobj" `
+light "target\wix\main.wixobj" "target\wix\userdata.wixobj" "target\wix\resources.wixobj" `
     -ext WixUIExtension -ext WixUtilExtension `
     -cultures:zh-CN `
     -loc "crates\winxime-server\wix\zh-cn.wxl" `

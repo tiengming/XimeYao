@@ -180,9 +180,6 @@
                             Name='XimeServer' Type='string' Value='[APPLICATIONFOLDER]winxime-server.exe' KeyPath='yes'/>
                     </Component>
                     
-                    <!-- Data folder: rime base data (harvested by heat) -->
-                    <Directory Id='DataFolder' Name='data'/>
-                    
                     <!-- User-data folder: schema files for first-run deploy (harvested by heat) -->
                     <Directory Id='UserDataFolder' Name='user-data'/>
                     
@@ -236,7 +233,7 @@
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs all binaries and data.'
+            Description='Installs all binaries, user data and resources.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
@@ -263,10 +260,7 @@
             <ComponentRef Id='ApplicationShortcut'/>
         </Feature>
         
-        <!-- Include harvested data and resources -->
-        <Feature Id='DataFiles' Level='1'>
-            <ComponentGroupRef Id='DataFiles'/>
-        </Feature>
+        <!-- Include harvested user-data and resources -->
         <Feature Id='UserDataFiles' Level='1'>
             <ComponentGroupRef Id='UserDataFiles'/>
         </Feature>
