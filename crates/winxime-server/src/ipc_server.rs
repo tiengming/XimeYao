@@ -1,6 +1,5 @@
 use crate::context::SharedInputContext;
 use crate::plugins::PluginHost;
-use crate::schema_manager::SchemaManager;
 use crate::ui::CandidateWindow;
 use interprocess::os::windows::named_pipe::{pipe_mode::Bytes, PipeListenerOptions};
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
@@ -14,9 +13,8 @@ use widestring::u16cstr;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
 use winxime_ipc::{
-    get_pipe_path, IpcCommand, IpcRequest, IpcRequestData, IpcResponse, SchemaMarketResponse,
+    get_pipe_path, IpcCommand, IpcRequest, IpcRequestData, IpcResponse,
 };
-use xime_config::XimeConfig;
 use xime_rime::RimeEngine;
 
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
@@ -27,14 +25,18 @@ pub fn run_ipc_server(
     window: Arc<CandidateWindow>,
     ascii_mode: Arc<AtomicBool>,
     main_thread_id: u32,
-    schema_mgr: Arc<SchemaManager>,
     plugin_host: Arc<PluginHost>,
 ) {
     let pipe_path = get_pipe_path();
     tracing::info!("Winxime Server: creating named pipe at {}", pipe_path);
 
-    let sd = SecurityDescriptor::deserialize(u16cstr!("D:(A;;GA;;;WD)"))
-        .expect("Failed to create security descriptor");
+    let sd = match SecurityDescriptor::deserialize(u16cstr!("D:(A;;GA;;;WD)")) {
+        Ok(sd) => sd,
+        Err(e) => {
+            tracing::error!("Failed to build security descriptor: {e}");
+            return;
+        }
+    };
 
     let listener = match PipeListenerOptions::new()
         .path(pipe_path)
@@ -60,7 +62,6 @@ pub fn run_ipc_server(
                 let window_clone = window.clone();
                 let ascii_mode_clone = ascii_mode.clone();
                 let tid = main_thread_id;
-                let schema_mgr_clone = schema_mgr.clone();
                 let plugin_host_clone = plugin_host.clone();
                 std::thread::spawn(move || {
                     handle_connection(
@@ -70,7 +71,6 @@ pub fn run_ipc_server(
                         window_clone,
                         ascii_mode_clone,
                         tid,
-                        schema_mgr_clone,
                         plugin_host_clone,
                     );
                 });
@@ -89,7 +89,6 @@ fn handle_connection(
     window: Arc<CandidateWindow>,
     ascii_mode: Arc<AtomicBool>,
     main_thread_id: u32,
-    schema_mgr: Arc<SchemaManager>,
     plugin_host: Arc<PluginHost>,
 ) {
     let (recv, send) = pipe.split();
@@ -131,8 +130,12 @@ fn handle_connection(
             Ok(r) => r,
             Err(_) => continue,
         };
-        tracing::info!("Received request: {:?}", request.command);
+        // 每次按键都走这里：`info!` 会把 server.log 写爆（历史 21MB 里有大半是这类行）。
+        tracing::trace!("Received request: {:?}", request.command);
 
+        // 单向命令：客户端只写不等回包（`IpcClient::send_no_reply`），下面**必须不写**。
+        // 协议没有请求 id，多写一条应答就留在管道里，被下一条请求当成自己的应答
+        // （候选词/上屏文本串位，且完全不报错）。
         let response = process_request(
             &request,
             &engine,
@@ -140,9 +143,12 @@ fn handle_connection(
             &window,
             &ascii_mode,
             main_thread_id,
-            &schema_mgr,
             &plugin_host,
         );
+
+        if request.command.is_one_way() {
+            continue;
+        }
 
         let json = match serde_json::to_vec(&response) {
             Ok(j) => j,
@@ -274,13 +280,6 @@ fn handle_list_schema_entries(
     };
     match outcome {
         Ok(read) => IpcResponse {
-            success: true,
-            session_id: request.session_id,
-            context: None,
-            status: None,
-            schema_list: None,
-            market_response: None,
-            dict_response: None,
             schema_dict_response: Some(winxime_ipc::SchemaDictResponse {
                 dict_name: read.dict_name,
                 tables: read.tables,
@@ -289,21 +288,11 @@ fn handle_list_schema_entries(
                 total: read.total,
                 matched: read.matched,
             }),
-            phrase_response: None,
+            ..IpcResponse::ok(request.session_id)
         },
         Err(reason) => {
             tracing::error!("读取方案词表失败：{reason}");
-            IpcResponse {
-                success: false,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: None,
-                dict_response: None,
-                schema_dict_response: None,
-                phrase_response: None,
-            }
+            IpcResponse::fail(request.session_id)
         }
     }
 }
@@ -324,14 +313,6 @@ fn handle_list_custom_phrases(
     };
     match outcome {
         Ok(read) => IpcResponse {
-            success: true,
-            session_id: request.session_id,
-            context: None,
-            status: None,
-            schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
             phrase_response: Some(winxime_ipc::CustomPhraseResponse {
                 dict_name: read.dict_name,
                 file_name: read.file_name,
@@ -340,20 +321,11 @@ fn handle_list_custom_phrases(
                 patch_added: false,
                 entries: read.entries,
             }),
+            ..IpcResponse::ok(request.session_id)
         },
         Err(reason) => {
             tracing::error!("读取快捷短语失败：{reason}");
-            IpcResponse {
-                success: false,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: None,
-                dict_response: None,
-                schema_dict_response: None,
-                phrase_response: None,
-            }
+            IpcResponse::fail(request.session_id)
         }
     }
 }
@@ -381,14 +353,6 @@ fn handle_save_custom_phrases(
     };
     match outcome {
         Ok(saved) => IpcResponse {
-            success: true,
-            session_id: request.session_id,
-            context: None,
-            status: None,
-            schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
             phrase_response: Some(winxime_ipc::CustomPhraseResponse {
                 dict_name: saved.dict_name,
                 file_name: saved.file_name,
@@ -397,21 +361,483 @@ fn handle_save_custom_phrases(
                 patch_added: saved.patch_added,
                 entries: saved.entries,
             }),
+            ..IpcResponse::ok(request.session_id)
         },
         Err(reason) => {
             tracing::error!("保存快捷短语失败：{reason}");
+            IpcResponse::fail(request.session_id)
+        }
+    }
+}
+
+/// 重载插件（扫描启用列表 + 起停剪贴板同步线程）。
+///
+/// 不碰 rime 引擎，所以放在拿引擎锁之前处理；`process_request` 的锁内分支也调它，
+/// 保证两条路径行为一致。
+fn handle_reload_plugins(plugin_host: &Arc<PluginHost>, session_id: u32) -> IpcResponse {
+    tracing::info!("ReloadPlugins requested");
+    plugin_host.reload();
+    IpcResponse::ok(session_id)
+}
+
+/// 退出服务（给主线程投 `WM_QUIT`）。
+///
+/// 不碰引擎：锁被占时也必须能退（见 `process_request` 的预分发注释）。
+fn handle_shutdown(main_thread_id: u32, session_id: u32) -> IpcResponse {
+    tracing::info!("Shutdown requested, posting WM_QUIT to main thread");
+    unsafe {
+        let _ = PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
+    IpcResponse::ok(session_id)
+}
+
+/// 插入点坐标上报（**单向命令**，客户端不等回包）。
+///
+/// 只写 `SharedInputContext`，不碰 rime 引擎——所以放在拿锁之前处理：引擎忙
+/// （同步用户资料 / 部署）时坐标也不会丢，候选栏不会停在旧位置。
+fn handle_update_position(
+    request: &IpcRequest,
+    context: &Arc<SharedInputContext>,
+) -> IpcResponse {
+    if let IpcRequestData::Position(pos) = &request.data {
+        // 每次按键都来一次，`info!` 会把日志写爆；排查定位问题时再开 trace。
+        tracing::trace!("Position: {},{}", pos.x, pos.y);
+        context.update(|ctx| {
+            ctx.caret_x = pos.x;
+            ctx.caret_y = pos.y;
+        });
+    }
+    IpcResponse::ok(request.session_id)
+}
+
+/// 系统通知（toast）。不碰引擎，锁外处理。
+///
+/// 系统通知由 server 弹（MSIX 包内进程，toast 可归属；设置进程直跑无包身份，
+/// toast 会被系统拒绝/无从归属）。
+fn handle_show_toast(request: &IpcRequest) -> IpcResponse {
+    let toast = match &request.data {
+        IpcRequestData::Toast(t) => Some(t.clone()),
+        _ => None,
+    };
+    let success = match toast {
+        Some(t) => {
+            // 所有 toast（包括设置页转发来的）都走统一入口：去重 + 限流 + 留日志。
+            crate::notify::notify_titled(&t.title, t.body);
+            true
+        }
+        None => false,
+    };
+    IpcResponse {
+        success,
+        session_id: request.session_id,
+        ..IpcResponse::default()
+    }
+}
+
+/// 处理按键（`ProcessKeyEvent`）。
+///
+/// `process_request` 里唯一的长分支：建议词模式、英文态、正常组词三条路径在此分流。
+fn handle_key_event(
+    request: &IpcRequest,
+    eng: &mut RimeEngine,
+    context: &Arc<SharedInputContext>,
+    window: &Arc<CandidateWindow>,
+    ascii_mode: &Arc<AtomicBool>,
+) -> IpcResponse {
+    // 候选栏「剪切板」面板点击后的自注入触发键（见 crate::paste）：
+    // 必须在其他分支之前识别——它不参与 rime 组词，也不受英文态影响。
+    if let IpcRequestData::KeyEvent(key) = &request.data {
+        if key.keycode == crate::paste::XK_PASTE_TRIGGER {
+            return handle_paste_trigger(
+                eng,
+                context,
+                window,
+                request.session_id,
+                key.modifiers,
+            );
+        }
+    }
+
+    let is_ascii = ascii_mode.load(Ordering::Acquire);
+    tracing::info!("Key event, ascii_mode={}", is_ascii);
+
+    let suggestion_state = context.read(|c| c.suggestion_state.clone());
+
+    if let Some(ref suggestion) = suggestion_state {
+        tracing::info!(
+            "  -> in suggestion mode, suggestions: {:?}",
+            suggestion.suggestions
+        );
+
+        if let IpcRequestData::KeyEvent(key) = &request.data {
+            if key.keycode == 32 {
+                tracing::info!("  -> Space in suggestion mode, commit suggestion");
+                if suggestion.highlighted < suggestion.suggestions.len() {
+                    let selected_word = &suggestion.suggestions[suggestion.highlighted];
+                    tracing::info!("  -> committing suggestion word: {}", selected_word);
+
+                    context.update(|ctx| {
+                        ctx.suggestion_state = None;
+                        ctx.commit_text = selected_word.clone();
+                    });
+                    window.hide();
+
+                    return IpcResponse {
+                        context: Some(winxime_ipc::Context {
+                            preedit: winxime_ipc::Text { str: String::new() },
+                            commit: Some(selected_word.clone()),
+                            candidates: winxime_ipc::CandidateInfo::default(),
+                        }),
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::ok(request.session_id)
+                    };
+                } else {
+                    context.update(|ctx| {
+                        ctx.suggestion_state = None;
+                    });
+                    window.hide();
+                    return IpcResponse {
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::fail(request.session_id)
+                    };
+                }
+            } else if key.keycode >= 49 && key.keycode <= 57 {
+                let index = (key.keycode - 49) as usize;
+                tracing::info!("  -> Number key {} in suggestion mode", index + 1);
+                if index < suggestion.suggestions.len() {
+                    let selected_word = &suggestion.suggestions[index];
+                    tracing::info!("  -> committing suggestion word: {}", selected_word);
+
+                    context.update(|ctx| {
+                        ctx.suggestion_state = None;
+                        ctx.commit_text = selected_word.clone();
+                    });
+                    window.hide();
+
+                    return IpcResponse {
+                        context: Some(winxime_ipc::Context {
+                            preedit: winxime_ipc::Text { str: String::new() },
+                            commit: Some(selected_word.clone()),
+                            candidates: winxime_ipc::CandidateInfo::default(),
+                        }),
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::ok(request.session_id)
+                    };
+                } else {
+                    return IpcResponse {
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::fail(request.session_id)
+                    };
+                }
+            } else {
+                tracing::info!(
+                    "  -> Other key in suggestion mode, clear suggestion and continue"
+                );
+                context.update(|ctx| {
+                    ctx.suggestion_state = None;
+                });
+                window.hide();
+            }
+        } else {
+            return IpcResponse {
+                status: Some(get_ipc_status(eng)),
+                ..IpcResponse::fail(request.session_id)
+            };
+        }
+    }
+
+    if is_ascii {
+        tracing::info!("  -> ASCII mode, not handling");
+        return IpcResponse {
+            status: Some(get_ipc_status(eng)),
+            ..IpcResponse::fail(request.session_id)
+        };
+    }
+
+    let handled = match &request.data {
+        IpcRequestData::KeyEvent(key) => {
+            tracing::info!("Key: {} mod: {}", key.keycode, key.modifiers);
+            let result = eng.process_key(key.keycode, key.modifiers);
+            tracing::info!("  handled: {}", result);
+            result
+        }
+        _ => false,
+    };
+
+    let commit = eng.get_commit();
+    tracing::info!("  commit: {:?}", commit);
+    info!("  input: {:?}", eng.get_input());
+    info!("  composing: {}", eng.is_composing());
+
+    if let Some(ref commit_text) = commit {
+        tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
+    }
+
+    let ipc_ctx = get_ipc_context(eng, &commit);
+    update_context(eng, context, &commit);
+
+    if let Some(ref commit_text) = commit {
+        tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
+
+        tracing::info!("  -> hide (commit)");
+        context.update(|ctx| {
+            ctx.suggestion_state = None;
+        });
+        window.hide();
+        IpcResponse {
+            success: handled,
+            session_id: request.session_id,
+            context: ipc_ctx,
+            status: Some(get_ipc_status(eng)),
+            ..IpcResponse::default()
+        }
+    } else if !eng.is_composing() {
+        tracing::info!("  -> hide (not composing)");
+        context.update(|ctx| {
+            ctx.suggestion_state = None;
+        });
+        window.hide();
+        IpcResponse {
+            success: handled,
+            session_id: request.session_id,
+            context: ipc_ctx,
+            status: Some(get_ipc_status(eng)),
+            ..IpcResponse::default()
+        }
+    } else if let Some(ctx) = &ipc_ctx {
+        tracing::info!("  candies: {:?}", ctx.candidates.candies);
+        if ctx.candidates.candies.is_empty() {
+            tracing::info!("  -> hide (no candidates)");
+            window.hide();
+        } else {
+            let pos = context.read(|c| (c.caret_x, c.caret_y));
+            tracing::info!("  -> show at ({}, {})", pos.0, pos.1);
+            window.show(pos.0, pos.1);
+            info!("  -> update {} candies", ctx.candidates.candies.len());
+            window.update(ctx);
+        }
+
+        IpcResponse {
+            success: handled,
+            session_id: request.session_id,
+            context: ipc_ctx,
+            status: Some(get_ipc_status(eng)),
+            ..IpcResponse::default()
+        }
+    } else {
+        IpcResponse {
+            success: handled,
+            session_id: request.session_id,
+            context: ipc_ctx,
+            status: Some(get_ipc_status(eng)),
+            ..IpcResponse::default()
+        }
+    }
+}
+
+/// 词典管理命令：列表 / 逐条浏览 / 导入导出 / 备份恢复。
+///
+/// 与键事件同理，它们都只依赖引擎和插件目录，单独成函数后
+/// `process_request` 里只剩一行转发。
+fn handle_dict_command(
+    request: &IpcRequest,
+    eng: &mut RimeEngine,
+    context: &Arc<SharedInputContext>,
+    window: &Arc<CandidateWindow>,
+) -> IpcResponse {
+    match request.command {
+        IpcCommand::ListUserDicts => {
+            tracing::info!("ListUserDicts requested");
+            let dicts = librime::list_user_dicts();
+            let sync_dir = librime::get_user_data_sync_dir();
             IpcResponse {
-                success: false,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: None,
-                dict_response: None,
-                schema_dict_response: None,
-                phrase_response: None,
+                dict_response: Some(winxime_ipc::DictResponse {
+                    dicts,
+                    count: 0,
+                    sync_dir,
+                    entries: Vec::new(),
+                    total: 0,
+                }),
+                ..IpcResponse::ok(request.session_id)
             }
         }
+
+        IpcCommand::ListDictEntries => {
+            // 逐条浏览用户词典：经 librime 导出通道读成文本码表再解析
+            // （librime 没有"读词条"的 C 接口，见 crate::user_dict 模块注释）。
+            let query = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictQuery(dict, query) => {
+                    Some((dict.clone(), query.clone()))
+                }
+                _ => None,
+            };
+            tracing::info!("ListDictEntries requested: {:?}", query.as_ref().map(|q| &q.0));
+            let outcome = match query {
+                // 读词条 = 让 librime **导出一份用户词典文本**再解析；而 librime 要求
+                // user dict 在 Export 前处于**关闭**状态（与 Import/Backup/Restore 同一条约束）。
+                // 原来直接在会话里导出 → `ExportUserDict` 恒失败，设置页看到的是
+                // 「读取词条失败（输入法服务未运行？）」，其实服务活得好好的。
+                // 走 `with_user_dict_closed`：关会话 → 导出 → 重建会话
+                // （路由器与 ImportDictEntry 一致；代价是当前未上屏的组词会丢）。
+                Some((dict, query)) => eng
+                    .with_user_dict_closed(move || crate::user_dict::read_user_dict(&dict, &query)),
+                None => Err("缺少词典名".to_string()),
+            };
+            match outcome {
+                Ok(read) => IpcResponse {
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        dicts: Vec::new(),
+                        count: read.matched,
+                        sync_dir: String::new(),
+                        entries: read.entries,
+                        total: read.total,
+                    }),
+                    ..IpcResponse::ok(request.session_id)
+                },
+                Err(reason) => {
+                    tracing::error!("读取用户词典词条失败：{reason}");
+                    IpcResponse::fail(request.session_id)
+                }
+            }
+        }
+
+        IpcCommand::ImportDictEntry => {
+            // 写入一条用户词条（频率 > 0 新增、< 0 删除标记）。librime 要求
+            // user dict 在 Backup/Restore/Export/Import 前处于关闭状态——
+            // 销毁会话 → 导入 → 重建会话（RimeEngine::with_user_dict_closed）。
+            // 代价：正在输入的句子会丢；重建后照 FocusOut 的做法清掉残留的
+            // 候选窗与输入上下文，免得宿主对着已不存在的 composition 继续画。
+            let entry = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictEntry(dict, word, code, commits) => {
+                    Some((dict.clone(), word.clone(), code.clone(), *commits))
+                }
+                _ => None,
+            };
+            tracing::info!("ImportDictEntry requested");
+            let outcome = match entry {
+                Some((dict, word, code, commits)) => {
+                    let result = eng.with_user_dict_closed(move || {
+                        crate::user_dict::import_entry(&dict, &word, &code, commits)
+                    });
+                    eng.clear_composition();
+                    window.hide();
+                    context.update(|ctx| {
+                        ctx.suggestion_state = None;
+                    });
+                    result
+                }
+                None => Err("缺少词条参数".to_string()),
+            };
+            match outcome {
+                Ok(count) => IpcResponse {
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        dicts: Vec::new(),
+                        count,
+                        sync_dir: String::new(),
+                        entries: Vec::new(),
+                        total: 0,
+                    }),
+                    ..IpcResponse::ok(request.session_id)
+                },
+                Err(reason) => {
+                    tracing::error!("写入用户词条失败：{reason}");
+                    IpcResponse::fail(request.session_id)
+                }
+            }
+        }
+
+        IpcCommand::BackupUserDict => {
+            tracing::info!("BackupUserDict requested");
+            let dict = match &request.data {
+                winxime_ipc::IpcRequestData::UserDict(name) => Some(name.clone()),
+                _ => None,
+            };
+            let result = match dict {
+                Some(name) => librime::backup_user_dict(&name).map(|_| 0),
+                None => Err(librime::error::Error::InvalidUtf8),
+            };
+            let success = result.is_ok();
+            IpcResponse {
+                success,
+                session_id: request.session_id,
+                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
+                dicts: Vec::new(),
+                count,
+                sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
+            }),
+                ..IpcResponse::default()
+            }
+        }
+
+        IpcCommand::RestoreUserDict => {
+            tracing::info!("RestoreUserDict requested");
+            let path = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictPath(p) => Some(p.clone()),
+                _ => None,
+            };
+            let success = path
+                .map(|p| librime::restore_user_dict(&p).is_ok())
+                .unwrap_or(false);
+            IpcResponse {
+                success,
+                session_id: request.session_id,
+                ..IpcResponse::default()
+            }
+        }
+
+        IpcCommand::ExportUserDict => {
+            tracing::info!("ExportUserDict requested");
+            let file = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
+                _ => None,
+            };
+            let result = match file {
+                Some((dict, path)) => librime::export_user_dict(&dict, &path),
+                None => Err(librime::error::Error::InvalidUtf8),
+            };
+            let success = result.is_ok();
+            IpcResponse {
+                success,
+                session_id: request.session_id,
+                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
+                dicts: Vec::new(),
+                count,
+                sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
+            }),
+                ..IpcResponse::default()
+            }
+        }
+
+        IpcCommand::ImportUserDict => {
+            tracing::info!("ImportUserDict requested");
+            let file = match &request.data {
+                winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
+                _ => None,
+            };
+            let result = match file {
+                Some((dict, path)) => librime::import_user_dict(&dict, &path),
+                None => Err(librime::error::Error::InvalidUtf8),
+            };
+            let success = result.is_ok();
+            IpcResponse {
+                success,
+                session_id: request.session_id,
+                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
+                dicts: Vec::new(),
+                count,
+                sync_dir: String::new(),
+                entries: Vec::new(),
+                total: 0,
+            }),
+                ..IpcResponse::default()
+            }
+        }
+        // 只有 process_request 确认命令属于本组后才会调到这里
+        _ => IpcResponse::fail(request.session_id),
     }
 }
 
@@ -422,10 +848,9 @@ fn process_request(
     window: &Arc<CandidateWindow>,
     ascii_mode: &Arc<AtomicBool>,
     main_thread_id: u32,
-    schema_mgr: &Arc<SchemaManager>,
     plugin_host: &Arc<PluginHost>,
 ) -> IpcResponse {
-    // 不碰引擎的词典文件命令在拿锁之前处理：方案词表首次解析大码表可能要
+    // 不碰引擎的命令在拿锁之前处理：方案词表首次解析大码表可能要
     // 几百毫秒（pinyin_simp ~39 万条），持锁做会挡住正在打字的键事件
     // （引擎 try_lock 失败时键事件直接失败）。这些命令只读/写 rime 目录的
     // 文件，不需要会话。
@@ -439,9 +864,30 @@ fn process_request(
         IpcCommand::SaveCustomPhrases => {
             return handle_save_custom_phrases(request, plugin_host);
         }
+        // 插件重载只扫插件目录 + 起停剪贴板同步线程，完全不碰 rime 引擎。
+        // 插件多时目录扫描 + manifest 解析不便宜，放在锁内会挡住正在打的字。
+        IpcCommand::ReloadPlugins => {
+            return handle_reload_plugins(plugin_host, request.session_id);
+        }
+        // 位置上报：只写 `SharedInputContext`，不碰引擎；而且它是**单向命令**
+        // （客户端只写不等回包，服务端在 `handle_connection` 里跳过回包）。
+        // 放锁外之后，引擎忙（同步资料 / 部署）时坐标也不会丢。
+        IpcCommand::UpdateInputPosition => {
+            return handle_update_position(request, context);
+        }
+        // 退出只是 PostThreadMessageW，跟引擎无关。留在锁后面的话，引擎正忙
+        // （同步用户资料、重载配置、部署）时 `try_lock` 失败 → 直接回 fail，
+        // 托盘「退出」点了没反应，用户只能去任务管理器杀进程。
+        IpcCommand::ShutdownServer => {
+            return handle_shutdown(main_thread_id, request.session_id);
+        }
+        // 系统通知同理：只调 toast API，不读引擎。每次弹通知都在锁内排队没有理由。
+        IpcCommand::ShowToast => {
+            return handle_show_toast(request);
+        }
         // 语音命令同样不碰 rime 引擎：语音引擎是独立的全局单例（自己一条工作
         // 线程 + 一个下载线程），拿 rime 引擎锁只会白白挡住打字。下载更是**不能**
-        // 在这里等（132MB，IPC 客户端 100ms 静默即超时）——只投命令、立刻回状态，
+        // 在这里等（132MB，快命令 1s 就判超时）——只投命令、立刻回状态，
         // 进度由设置页轮询 GetSpeechStatus 取。
         IpcCommand::GetSpeechStatus
         | IpcCommand::SpeechDownload
@@ -459,75 +905,37 @@ fn process_request(
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             tracing::info!("Engine lock would block, returning error response");
-            return IpcResponse {
-                success: false,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            };
+            return IpcResponse::fail(request.session_id);
         }
     };
 
     match request.command {
-        IpcCommand::Echo => IpcResponse {
-            success: true,
-            session_id: request.session_id,
-            context: None,
-            status: None,
-            schema_list: None,
-        market_response: None,
-        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+        IpcCommand::Echo => IpcResponse::ok(request.session_id),
+
+        // 只读状态：设置页启动时用来把「当前方案」标对行（不建会话、不改状态）。
+        IpcCommand::GetStatus => IpcResponse {
+            status: Some(get_ipc_status(&eng)),
+            ..IpcResponse::ok(request.session_id)
         },
 
         IpcCommand::StartSession => {
             tracing::info!("StartSession");
             IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::ok(request.session_id)
             }
         }
 
         IpcCommand::EndSession => {
             tracing::info!("EndSession");
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::FocusIn => {
             tracing::info!("FocusIn");
             IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::ok(request.session_id)
             }
         }
 
@@ -535,308 +943,22 @@ fn process_request(
             tracing::info!("FocusOut -> hide composition");
             eng.clear_composition();
             window.hide();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::ProcessKeyEvent => {
-            // 候选栏「剪切板」面板点击后的自注入触发键（见 crate::paste）：
-            // 必须在其他分支之前识别——它不参与 rime 组词，也不受英文态影响。
-            if let IpcRequestData::KeyEvent(key) = &request.data {
-                if key.keycode == crate::paste::XK_PASTE_TRIGGER {
-                    return handle_paste_trigger(
-                        &mut eng,
-                        context,
-                        &window,
-                        request.session_id,
-                        key.modifiers,
-                    );
-                }
-            }
-
-            let is_ascii = ascii_mode.load(Ordering::Acquire);
-            tracing::info!("Key event, ascii_mode={}", is_ascii);
-
-            let suggestion_state = context.read(|c| c.suggestion_state.clone());
-
-            if let Some(ref suggestion) = suggestion_state {
-                tracing::info!(
-                    "  -> in suggestion mode, suggestions: {:?}",
-                    suggestion.suggestions
-                );
-
-                if let IpcRequestData::KeyEvent(key) = &request.data {
-                    if key.keycode == 32 {
-                        tracing::info!("  -> Space in suggestion mode, commit suggestion");
-                        if suggestion.highlighted < suggestion.suggestions.len() {
-                            let selected_word = &suggestion.suggestions[suggestion.highlighted];
-                            tracing::info!("  -> committing suggestion word: {}", selected_word);
-
-                            context.update(|ctx| {
-                                ctx.suggestion_state = None;
-                                ctx.commit_text = selected_word.clone();
-                            });
-                            window.hide();
-
-                            return IpcResponse {
-                                success: true,
-                                session_id: request.session_id,
-                                context: Some(winxime_ipc::Context {
-                                    preedit: winxime_ipc::Text { str: String::new() },
-                                    commit: Some(selected_word.clone()),
-                                    candidates: winxime_ipc::CandidateInfo::default(),
-                                }),
-                                status: Some(get_ipc_status(&eng)),
-                                schema_list: None,
-                            market_response: None,
-                            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                            };
-                        } else {
-                            context.update(|ctx| {
-                                ctx.suggestion_state = None;
-                            });
-                            window.hide();
-                            return IpcResponse {
-                                success: false,
-                                session_id: request.session_id,
-                                context: None,
-                                status: Some(get_ipc_status(&eng)),
-                                schema_list: None,
-                            market_response: None,
-                            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                            };
-                        }
-                    } else if key.keycode >= 49 && key.keycode <= 57 {
-                        let index = (key.keycode - 49) as usize;
-                        tracing::info!("  -> Number key {} in suggestion mode", index + 1);
-                        if index < suggestion.suggestions.len() {
-                            let selected_word = &suggestion.suggestions[index];
-                            tracing::info!("  -> committing suggestion word: {}", selected_word);
-
-                            context.update(|ctx| {
-                                ctx.suggestion_state = None;
-                                ctx.commit_text = selected_word.clone();
-                            });
-                            window.hide();
-
-                            return IpcResponse {
-                                success: true,
-                                session_id: request.session_id,
-                                context: Some(winxime_ipc::Context {
-                                    preedit: winxime_ipc::Text { str: String::new() },
-                                    commit: Some(selected_word.clone()),
-                                    candidates: winxime_ipc::CandidateInfo::default(),
-                                }),
-                                status: Some(get_ipc_status(&eng)),
-                                schema_list: None,
-                            market_response: None,
-                            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                            };
-                        } else {
-                            return IpcResponse {
-                                success: false,
-                                session_id: request.session_id,
-                                context: None,
-                                status: Some(get_ipc_status(&eng)),
-                                schema_list: None,
-                            market_response: None,
-                            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                            };
-                        }
-                    } else {
-                        tracing::info!(
-                            "  -> Other key in suggestion mode, clear suggestion and continue"
-                        );
-                        context.update(|ctx| {
-                            ctx.suggestion_state = None;
-                        });
-                        window.hide();
-                    }
-                } else {
-                    return IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: Some(get_ipc_status(&eng)),
-                        schema_list: None,
-                    market_response: None,
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                    };
-                }
-            }
-
-            if is_ascii {
-                tracing::info!("  -> ASCII mode, not handling");
-                return IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
-                    status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                };
-            }
-
-            let handled = match &request.data {
-                IpcRequestData::KeyEvent(key) => {
-                    tracing::info!("Key: {} mod: {}", key.keycode, key.modifiers);
-                    let result = eng.process_key(key.keycode, key.modifiers);
-                    tracing::info!("  handled: {}", result);
-                    result
-                }
-                _ => false,
-            };
-
-            let commit = eng.get_commit();
-            tracing::info!("  commit: {:?}", commit);
-            info!("  input: {:?}", eng.get_input());
-            info!("  composing: {}", eng.is_composing());
-
-            if let Some(ref commit_text) = commit {
-                tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
-            }
-
-            let ipc_ctx = get_ipc_context(&eng, &commit);
-            update_context(&mut eng, context, &commit);
-
-            if let Some(ref commit_text) = commit {
-                tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
-
-                tracing::info!("  -> hide (commit)");
-                context.update(|ctx| {
-                    ctx.suggestion_state = None;
-                });
-                window.hide();
-                return IpcResponse {
-                    success: handled,
-                    session_id: request.session_id,
-                    context: ipc_ctx,
-                    status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                };
-            } else if !eng.is_composing() {
-                tracing::info!("  -> hide (not composing)");
-                context.update(|ctx| {
-                    ctx.suggestion_state = None;
-                });
-                window.hide();
-                return IpcResponse {
-                    success: handled,
-                    session_id: request.session_id,
-                    context: ipc_ctx,
-                    status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                };
-            } else if let Some(ctx) = &ipc_ctx {
-                tracing::info!("  candies: {:?}", ctx.candidates.candies);
-                if ctx.candidates.candies.is_empty() {
-                    tracing::info!("  -> hide (no candidates)");
-                    window.hide();
-                } else {
-                    let pos = context.read(|c| (c.caret_x, c.caret_y));
-                    tracing::info!("  -> show at ({}, {})", pos.0, pos.1);
-                    window.show(pos.0, pos.1);
-                    info!("  -> update {} candies", ctx.candidates.candies.len());
-                    window.update(ctx);
-                }
-
-                return IpcResponse {
-                    success: handled,
-                    session_id: request.session_id,
-                    context: ipc_ctx,
-                    status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                };
-            } else {
-                return IpcResponse {
-                    success: handled,
-                    session_id: request.session_id,
-                    context: ipc_ctx,
-                    status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                };
-            }
+            handle_key_event(request, &mut eng, context, window, ascii_mode)
         }
 
         IpcCommand::UpdateInputPosition => {
-            match &request.data {
-                IpcRequestData::Position(pos) => {
-                    tracing::info!("Position: {},{}", pos.x, pos.y);
-                    context.update(|ctx| {
-                        ctx.caret_x = pos.x;
-                        ctx.caret_y = pos.y;
-                    });
-                }
-                _ => {}
-            }
-
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽。
+            handle_update_position(request, context)
         }
 
         IpcCommand::ShutdownServer => {
-            tracing::info!("Shutdown requested, posting WM_QUIT to main thread");
-            unsafe {
-                let _ = PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-            }
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽，
+            // 两边共用同一实现，避免以后改一处漏一处。
+            handle_shutdown(main_thread_id, request.session_id)
         }
 
         IpcCommand::ToggleAsciiMode => {
@@ -892,49 +1014,23 @@ fn process_request(
                 None
             };
 
-            update_context(&mut eng, &context, &None);
+            update_context(&mut eng, context, &None);
 
             IpcResponse {
-                success: true,
-                session_id: request.session_id,
                 context: ctx,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::ok(request.session_id)
             }
         }
 
         IpcCommand::ShowTrayIcon => {
             crate::tray::show_icon();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::HideTrayIcon => {
             crate::tray::hide_icon();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::HideCandidates => {
@@ -944,50 +1040,54 @@ fn process_request(
                 ctx.candidates.clear();
                 ctx.commit_text.clear();
             });
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::ReloadConfig => {
             tracing::info!("ReloadConfig requested");
+            // 配置可能被设置程序改过：先丢缓存，redeploy 之后的状态与样式都从新配置出。
+            crate::config::invalidate();
+            // 候选数量变了要把 rime 的 `menu/page_size` 一起对齐，否则部署完还是老页大小。
+            let (_, user_dir) = xime_config::get_data_dirs();
+            crate::sync_rime_page_size(&user_dir, crate::config::get().style.candidate_count);
             let deploy_result = eng.redeploy();
-            tracing::info!("  redeploy result: {}", deploy_result);
+            // 部署会重建会话：**部署后引擎实际用的是哪个方案**必须留痕。
+            // 「部署完又回到 emoji」这类问题，看这一行就够了。
+            tracing::info!(
+                "  redeploy result: {}, active schema after redeploy: {:?}",
+                deploy_result,
+                eng.get_current_schema()
+            );
+            // 部署是用户显式动作（或候选数量改动）触发的，结果必须让用户看见。
+            let status = get_ipc_status(&eng);
+            if deploy_result {
+                crate::notify::notify(format!("已部署「{}」", status.schema_name));
+            } else {
+                crate::notify::notify(format!(
+                    "部署「{}」失败，详见 server.log",
+                    status.schema_name
+                ));
+            }
+
+            if let Some(id) = eng.get_current_schema() {
+                crate::warn_if_schema_overrides_page_size(
+                    &user_dir,
+                    &id,
+                    crate::config::get().style.candidate_count.clamp(1, 10) as usize,
+                );
+            }
             IpcResponse {
                 success: deploy_result,
                 session_id: request.session_id,
-                context: None,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::default()
             }
         }
 
         IpcCommand::ReloadPlugins => {
-            tracing::info!("ReloadPlugins requested");
-            plugin_host.reload();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽，
+            // 两边共用同一实现，避免以后改一处漏一处。
+            handle_reload_plugins(plugin_host, request.session_id)
         }
 
         IpcCommand::SyncUserData => {
@@ -1003,149 +1103,20 @@ fn process_request(
             IpcResponse {
                 success,
                 session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::default()
             }
         }
 
-        IpcCommand::ListUserDicts => {
-            tracing::info!("ListUserDicts requested");
-            let dicts = librime::list_user_dicts();
-            let sync_dir = librime::get_user_data_sync_dir();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: Some(winxime_ipc::DictResponse {
-                dicts,
-                count: 0,
-                sync_dir,
-                entries: Vec::new(),
-                total: 0,
-            }),
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+        IpcCommand::ListUserDicts
+        | IpcCommand::ListDictEntries
+        | IpcCommand::ImportDictEntry
+        | IpcCommand::BackupUserDict
+        | IpcCommand::RestoreUserDict
+        | IpcCommand::ExportUserDict
+        | IpcCommand::ImportUserDict => {
+            handle_dict_command(request, &mut eng, context, window)
         }
 
-        IpcCommand::ListDictEntries => {
-            // 逐条浏览用户词典：经 librime 导出通道读成文本码表再解析
-            // （librime 没有"读词条"的 C 接口，见 crate::user_dict 模块注释）。
-            let query = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictQuery(dict, query) => {
-                    Some((dict.clone(), query.clone()))
-                }
-                _ => None,
-            };
-            tracing::info!("ListDictEntries requested: {:?}", query.as_ref().map(|q| &q.0));
-            let outcome = match query {
-                Some((dict, query)) => crate::user_dict::read_user_dict(&dict, &query),
-                None => Err("缺少词典名".to_string()),
-            };
-            match outcome {
-                Ok(read) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: None,
-                    dict_response: Some(winxime_ipc::DictResponse {
-                        dicts: Vec::new(),
-                        count: read.matched,
-                        sync_dir: String::new(),
-                        entries: read.entries,
-                        total: read.total,
-                    }),
-                    schema_dict_response: None,
-                    phrase_response: None,
-                },
-                Err(reason) => {
-                    tracing::error!("读取用户词典词条失败：{reason}");
-                    IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: None,
-                        schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                    }
-                }
-            }
-        }
-
-        IpcCommand::ImportDictEntry => {
-            // 写入一条用户词条（频率 > 0 新增、< 0 删除标记）。librime 要求
-            // user dict 在 Backup/Restore/Export/Import 前处于关闭状态——
-            // 销毁会话 → 导入 → 重建会话（RimeEngine::with_user_dict_closed）。
-            // 代价：正在输入的句子会丢；重建后照 FocusOut 的做法清掉残留的
-            // 候选窗与输入上下文，免得宿主对着已不存在的 composition 继续画。
-            let entry = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictEntry(dict, word, code, commits) => {
-                    Some((dict.clone(), word.clone(), code.clone(), *commits))
-                }
-                _ => None,
-            };
-            tracing::info!("ImportDictEntry requested");
-            let outcome = match entry {
-                Some((dict, word, code, commits)) => {
-                    let result = eng.with_user_dict_closed(move || {
-                        crate::user_dict::import_entry(&dict, &word, &code, commits)
-                    });
-                    eng.clear_composition();
-                    window.hide();
-                    context.update(|ctx| {
-                        ctx.suggestion_state = None;
-                    });
-                    result
-                }
-                None => Err("缺少词条参数".to_string()),
-            };
-            match outcome {
-                Ok(count) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: None,
-                    dict_response: Some(winxime_ipc::DictResponse {
-                        dicts: Vec::new(),
-                        count,
-                        sync_dir: String::new(),
-                        entries: Vec::new(),
-                        total: 0,
-                    }),
-                    schema_dict_response: None,
-                    phrase_response: None,
-                },
-                Err(reason) => {
-                    tracing::error!("写入用户词条失败：{reason}");
-                    IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: None,
-                        schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-                        schema_dict_response: None,
-                        phrase_response: None,
-                    }
-                }
-            }
-        }
 
         IpcCommand::ListSchemaEntries => {
             // 不碰引擎的文件命令（见 process_request 开头的预分发注释）。
@@ -1156,143 +1127,13 @@ fn process_request(
 
         IpcCommand::SaveCustomPhrases => handle_save_custom_phrases(request, plugin_host),
 
-        IpcCommand::BackupUserDict => {
-            tracing::info!("BackupUserDict requested");
-            let dict = match &request.data {
-                winxime_ipc::IpcRequestData::UserDict(name) => Some(name.clone()),
-                _ => None,
-            };
-            let result = match dict {
-                Some(name) => librime::backup_user_dict(&name).map(|_| 0),
-                None => Err(librime::error::Error::InvalidUtf8),
-            };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-            }),
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
 
-        IpcCommand::RestoreUserDict => {
-            tracing::info!("RestoreUserDict requested");
-            let path = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictPath(p) => Some(p.clone()),
-                _ => None,
-            };
-            let success = path
-                .map(|p| librime::restore_user_dict(&p).is_ok())
-                .unwrap_or(false);
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
 
-        IpcCommand::ExportUserDict => {
-            tracing::info!("ExportUserDict requested");
-            let file = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
-                _ => None,
-            };
-            let result = match file {
-                Some((dict, path)) => librime::export_user_dict(&dict, &path),
-                None => Err(librime::error::Error::InvalidUtf8),
-            };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-            }),
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
 
-        IpcCommand::ImportUserDict => {
-            tracing::info!("ImportUserDict requested");
-            let file = match &request.data {
-                winxime_ipc::IpcRequestData::UserDictFile(d, p) => Some((d.clone(), p.clone())),
-                _ => None,
-            };
-            let result = match file {
-                Some((dict, path)) => librime::import_user_dict(&dict, &path),
-                None => Err(librime::error::Error::InvalidUtf8),
-            };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-            market_response: None,
-            dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-            }),
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
 
         IpcCommand::ShowToast => {
-            // 系统通知由 server 弹（MSIX 包内进程，toast 可归属；
-            // 设置进程直跑无包身份，toast 会被系统拒绝/无从归属）。
-            let toast = match &request.data {
-                winxime_ipc::IpcRequestData::Toast(t) => Some(t.clone()),
-                _ => None,
-            };
-            let success = match toast {
-                Some(t) => {
-                    crate::toast::show_toast(&t.title, &t.body);
-                    true
-                }
-                None => false,
-            };
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽。
+            handle_show_toast(request)
         }
 
         IpcCommand::GetSchemaList => {
@@ -1306,15 +1147,9 @@ fn process_request(
                 })
                 .collect();
             IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
                 status: Some(get_ipc_status(&eng)),
                 schema_list: Some(schema_list),
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::ok(request.session_id)
             }
         }
 
@@ -1331,46 +1166,37 @@ fn process_request(
                     if eng.select_schema(&id) {
                         // 选中记录由 librime 写进 rime 用户目录 user.yaml
                         // （var/previously_selected_schema），无需另行持久化。
-                        tracing::info!("  -> schema selected successfully");
+                        // 同时打印**引擎实际报的**方案：用户报「设置里又回到别的方案」时，
+                        // 这一行能直接分辨是引擎没切过去、还是设置页取错了值。
+                        tracing::info!(
+                            "  -> schema selected successfully: requested={}, engine={:?}",
+                            id,
+                            eng.get_current_schema()
+                        );
                         IpcResponse {
-                            success: true,
-                            session_id: request.session_id,
-                            context: None,
                             status: Some(get_ipc_status(&eng)),
-                            schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                            ..IpcResponse::ok(request.session_id)
                         }
                     } else {
                         // 拒绝的原因几乎总是「方案未部署」（build/ 无产物）：选进
                         // 未部署方案会得到死会话（所有按键不组词），宁拒不选。
                         // 设置端收到失败后会走「写入方案列表 + 部署」的持久化路径。
-                        tracing::info!("  -> schema selection failed: {} 未部署或不存在", id);
+                        tracing::info!(
+                            "  -> schema selection failed: {} 未部署或不存在 (engine={:?})",
+                            id,
+                            eng.get_current_schema()
+                        );
+                        // 设置页那边也会提示；这里补一条系统通知，关掉设置窗口后也看得到。
+                        crate::notify::notify(format!("切换方案失败：「{id}」未部署"));
                         IpcResponse {
-                            success: false,
-                            session_id: request.session_id,
-                            context: None,
                             status: Some(get_ipc_status(&eng)),
-                            schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                            ..IpcResponse::fail(request.session_id)
                         }
                     }
                 }
                 None => IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
                     status: Some(get_ipc_status(&eng)),
-                    schema_list: None,
-                market_response: None,
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                    ..IpcResponse::fail(request.session_id)
                 },
             }
         }
@@ -1387,7 +1213,7 @@ fn process_request(
 
             match letter {
                 Some(c) => {
-                    let config = XimeConfig::load();
+                    let config = crate::config::get();
                     let schema_id = eng.get_status().map(|s| s.schema_id).unwrap_or_default();
                     tracing::info!(
                         "  -> config loaded, schema_id={}, checking root for '{}'",
@@ -1403,41 +1229,22 @@ fn process_request(
                         IpcResponse {
                             success: result.is_ok(),
                             session_id: request.session_id,
-                            context: None,
                             status: Some(get_ipc_status(&eng)),
-                            schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                            ..IpcResponse::default()
                         }
                     } else {
                         tracing::warn!("  -> no root for key '{}' in schema '{}'", c, schema_id);
                         IpcResponse {
-                            success: false,
-                            session_id: request.session_id,
-                            context: None,
                             status: Some(get_ipc_status(&eng)),
-                            schema_list: None,
-                        market_response: None,
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                            ..IpcResponse::fail(request.session_id)
                         }
                     }
                 }
                 None => {
                     tracing::info!("  -> no letter provided");
                     IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
                         status: Some(get_ipc_status(&eng)),
-                        schema_list: None,
-                    market_response: None,
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                        ..IpcResponse::fail(request.session_id)
                     }
                 }
             }
@@ -1457,15 +1264,8 @@ fn process_request(
             }
 
             IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::ok(request.session_id)
             }
         }
 
@@ -1503,11 +1303,7 @@ fn process_request(
                 session_id: request.session_id,
                 context: ipc_ctx,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::default()
             }
         }
 
@@ -1534,231 +1330,11 @@ fn process_request(
                 session_id: request.session_id,
                 context: ipc_ctx,
                 status: Some(get_ipc_status(&eng)),
-                schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+                ..IpcResponse::default()
             }
         }
 
-        IpcCommand::FetchSchemaIndex => {
-            tracing::info!("FetchSchemaIndex requested");
-            match schema_mgr.fetch_index() {
-                Ok(text) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::Index(text)),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-                Err(e) => IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::Error(e)),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-            }
-        }
-
-        IpcCommand::DownloadSchema => {
-            tracing::info!("DownloadSchema requested");
-            let dl = match &request.data {
-                winxime_ipc::IpcRequestData::SchemaDownload(d) => d,
-                _ => {
-                    return IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: None,
-                        schema_list: None,
-                        market_response: Some(SchemaMarketResponse::Error(
-                            "无效的请求数据".to_string(),
-                        )),
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                    }
-                }
-            };
-            let result = schema_mgr.download_schema(
-                &dl.schema_id,
-                &dl.url,
-                dl.sha256.as_deref(),
-                &dl.filename,
-            );
-            match result {
-                Ok(()) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::DownloadDone(
-                        dl.schema_id.clone(),
-                    )),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-                Err(e) => IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::Error(e)),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-            }
-        }
-
-        IpcCommand::InstallSchema => {
-            tracing::info!("InstallSchema requested");
-            let sid = match &request.data {
-                winxime_ipc::IpcRequestData::SchemaInstall(d) => &d.schema_id,
-                _ => {
-                    return IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: None,
-                        schema_list: None,
-                        market_response: Some(SchemaMarketResponse::Error(
-                            "无效的请求数据".to_string(),
-                        )),
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                    }
-                }
-            };
-            match schema_mgr.install_schema(sid) {
-                Ok(()) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::InstallDone(sid.clone())),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-                Err(e) => IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::Error(e)),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-            }
-        }
-
-        IpcCommand::UninstallSchema => {
-            tracing::info!("UninstallSchema requested");
-            let sid = match &request.data {
-                winxime_ipc::IpcRequestData::SchemaUninstall(d) => &d.schema_id,
-                _ => {
-                    return IpcResponse {
-                        success: false,
-                        session_id: request.session_id,
-                        context: None,
-                        status: None,
-                        schema_list: None,
-                        market_response: Some(SchemaMarketResponse::Error(
-                            "无效的请求数据".to_string(),
-                        )),
-                        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                    }
-                }
-            };
-            match schema_mgr.uninstall_schema(sid) {
-                Ok(()) => IpcResponse {
-                    success: true,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::UninstallDone(sid.clone())),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-                Err(e) => IpcResponse {
-                    success: false,
-                    session_id: request.session_id,
-                    context: None,
-                    status: None,
-                    schema_list: None,
-                    market_response: Some(SchemaMarketResponse::Error(e)),
-                    dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-                },
-            }
-        }
-
-        IpcCommand::ListMarketSchemas => {
-            tracing::info!("ListMarketSchemas requested");
-            let packages = schema_mgr.list_market_schemas();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: Some(SchemaMarketResponse::PackageList(packages)),
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
-
-        IpcCommand::ListInstalledPackages => {
-            tracing::info!("ListInstalledPackages requested");
-            let packages = schema_mgr.list_installed_packages();
-            IpcResponse {
-                success: true,
-                session_id: request.session_id,
-                context: None,
-                status: None,
-                schema_list: None,
-                market_response: Some(SchemaMarketResponse::InstalledList(packages)),
-                dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-            }
-        }
-
-        _ => IpcResponse {
-            success: false,
-            session_id: request.session_id,
-            context: None,
-            status: None,
-            schema_list: None,
-            market_response: None,
-            dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
-        },
+        _ => IpcResponse::fail(request.session_id),
     }
 }
 
@@ -1813,84 +1389,6 @@ fn parse_rime_selected_schema(content: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_rime_selected_schema_reads_rime_record() {
-        // 真实 user.yaml 形态（librime 的 Switcher::SetActiveSchema + SchemaUpdate 写入）。
-        let sample = "var:\n  last_build_time: 1790754400\n  previously_selected_schema: wubi86\n  schema_access_time:\n    wubi86: 1790754400\n";
-        assert_eq!(
-            parse_rime_selected_schema(sample),
-            Some("wubi86".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_rime_selected_schema_without_record_is_none() {
-        // 老 user.yaml 只有 build 时间：无选中记录。
-        assert_eq!(
-            parse_rime_selected_schema("var:\n  last_build_time: 1790754400\n"),
-            None
-        );
-        // 空文件 / 非 YAML / 空值一律 None，避免把空方案 id 塞给 librime。
-        assert_eq!(parse_rime_selected_schema(""), None);
-        assert_eq!(parse_rime_selected_schema("var: ["), None);
-        assert_eq!(
-            parse_rime_selected_schema("var:\n  previously_selected_schema: '  '\n"),
-            None
-        );
-    }
-
-    /// 语音状态装配：测试进程里语音引擎**没初始化**（OnceLock 空），
-    /// 此时也必须给出「结构完整」的快照——设置页据此渲染列表与按钮，
-    /// 返回空列表会让页面显示成「没有模型」而不是「服务未就绪」。
-    #[test]
-    fn speech_status_reports_catalog_even_without_engine() {
-        let status = speech_status(None);
-        assert_eq!(status.state, "idle");
-        assert_eq!(
-            status.model_id,
-            xime_speech::AsrModelRegistry::default_profile().id,
-            "引擎未初始化时按默认模型回答（设置页要能显示名字）"
-        );
-        assert!(status.models_rev >= 0);
-        assert!(
-            !status.provider.is_empty(),
-            "后端说明不能是空串：页面那一行会变成一个空白"
-        );
-        // 模型列表要读盘（数据根在引擎上），引擎没起来时为空——设置页据
-        // 「服务未运行」显示，**不假装有模型可下**（点了只会失败）。
-        assert!(
-            status.models.is_empty(),
-            "引擎未初始化时不该凭空造出模型列表"
-        );
-        assert!(status.download.is_none(), "没有下载在进行");
-    }
-
-    /// 语音命令的错误也要带快照回去（一次往返：错误 + 最新状态）。
-    #[test]
-    fn speech_command_without_model_id_fails_but_carries_status() {
-        let request = winxime_ipc::IpcRequest {
-            command: IpcCommand::SpeechDownload,
-            session_id: 7,
-            data: winxime_ipc::IpcRequestData::None,
-        };
-        let response = handle_speech(&request);
-        assert!(!response.success, "缺模型 id 必须失败");
-        assert_eq!(response.session_id, 7);
-        let speech = response
-            .status
-            .and_then(|status| status.speech)
-            .expect("语音响应必须带快照");
-        assert!(
-            speech.error.is_some(),
-            "拒绝的原因要能显示给用户"
-        );
-    }
-}
-
 /// 处理候选栏面板的「点击上屏」触发键（server 自己 `SendInput` 注入的 VK_F24，
 /// 见 [`crate::paste`]）。
 ///
@@ -1927,8 +1425,6 @@ fn handle_paste_trigger(
     }
 
     IpcResponse {
-        success: true,
-        session_id,
         context: Some(winxime_ipc::Context {
             preedit: winxime_ipc::Text {
                 str: String::new(),
@@ -1937,11 +1433,7 @@ fn handle_paste_trigger(
             candidates: winxime_ipc::CandidateInfo::default(),
         }),
         status: Some(get_ipc_status(eng)),
-        schema_list: None,
-        market_response: None,
-        dict_response: None,
-            schema_dict_response: None,
-            phrase_response: None,
+        ..IpcResponse::ok(session_id)
     }
 }
 
@@ -2004,6 +1496,88 @@ fn get_ipc_context(eng: &RimeEngine, commit: &Option<String>) -> Option<winxime_
             labels: Vec::new(),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rime_selected_schema_reads_rime_record() {
+        // 真实 user.yaml 形态（librime 的 Switcher::SetActiveSchema + SchemaUpdate 写入）。
+        let sample = "var:\n  last_build_time: 1790754400\n  previously_selected_schema: wubi86\n  schema_access_time:\n    wubi86: 1790754400\n";
+        assert_eq!(
+            parse_rime_selected_schema(sample),
+            Some("wubi86".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rime_selected_schema_without_record_is_none() {
+        // 老 user.yaml 只有 build 时间：无选中记录。
+        assert_eq!(
+            parse_rime_selected_schema("var:\n  last_build_time: 1790754400\n"),
+            None
+        );
+        // 空文件 / 非 YAML / 空值一律 None，避免把空方案 id 塞给 librime。
+        assert_eq!(parse_rime_selected_schema(""), None);
+        assert_eq!(parse_rime_selected_schema("var: ["), None);
+        assert_eq!(
+            parse_rime_selected_schema("var:\n  previously_selected_schema: '  '\n"),
+            None
+        );
+    }
+
+    /// 语音状态装配：测试进程里语音引擎**没初始化**（OnceLock 空），
+    /// 此时也必须给出「结构完整」的快照——设置页据此渲染列表与按钮，
+    /// 返回空列表会让页面显示成「没有模型」而不是「服务未就绪」。
+    #[test]
+    fn speech_status_reports_catalog_even_without_engine() {
+        let status = speech_status(None);
+        assert_eq!(status.state, "idle");
+        assert_eq!(
+            status.model_id,
+            xime_speech::AsrModelRegistry::default_profile().id,
+            "引擎未初始化时按默认模型回答（设置页要能显示名字）"
+        );
+        assert_eq!(
+            status.models_rev,
+            crate::speech::download::models_rev(),
+            "快照里的模型版本号必须取自下载模块的同一个计数"
+        );
+        assert!(
+            !status.provider.is_empty(),
+            "后端说明不能是空串：页面那一行会变成一个空白"
+        );
+        // 模型列表要读盘（数据根在引擎上），引擎没起来时为空——设置页据
+        // 「服务未运行」显示，**不假装有模型可下**（点了只会失败）。
+        assert!(
+            status.models.is_empty(),
+            "引擎未初始化时不该凭空造出模型列表"
+        );
+        assert!(status.download.is_none(), "没有下载在进行");
+    }
+
+    /// 语音命令的错误也要带快照回去（一次往返：错误 + 最新状态）。
+    #[test]
+    fn speech_command_without_model_id_fails_but_carries_status() {
+        let request = winxime_ipc::IpcRequest {
+            command: IpcCommand::SpeechDownload,
+            session_id: 7,
+            data: winxime_ipc::IpcRequestData::None,
+        };
+        let response = handle_speech(&request);
+        assert!(!response.success, "缺模型 id 必须失败");
+        assert_eq!(response.session_id, 7);
+        let speech = response
+            .status
+            .and_then(|status| status.speech)
+            .expect("语音响应必须带快照");
+        assert!(
+            speech.error.is_some(),
+            "拒绝的原因要能显示给用户"
+        );
+    }
 }
 
 

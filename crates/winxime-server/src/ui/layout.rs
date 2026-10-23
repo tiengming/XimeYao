@@ -10,6 +10,16 @@ use super::model::{CandidateModel, RenderedMetrics, RootModel};
 use super::panel::{panel_extra_height, PanelPage, MENU_BUTTON_GAP, MENU_BUTTON_SIZE, PANEL_MIN_WIDTH};
 use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
 
+/// 候选栏行数。
+///
+/// `cand_per_row` 是**用户配置**来的（`style.candidate_count`），可能是 0 或负数。
+/// 直接拿它当除数会得到 `inf`，一路传成窗口高度的 `inf`（`SetWindowPos` 收到无穷大）。
+/// 这里统一按「至少 1 列」算，调用方不必再各自防。
+fn row_count(items: usize, cand_per_row: usize) -> f32 {
+    let columns = cand_per_row.max(1) as f32;
+    (items as f32 / columns).ceil().max(1.0)
+}
+
     pub(crate) fn calculate_client_rect(
         dwrite: &IDWriteFactory1,
         model: &CandidateModel,
@@ -35,7 +45,6 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
             let mut item_widths = Vec::new();
             let mut selkey_widths = Vec::new();
             let mut text_widths = Vec::new();
-            let mut comment_widths = Vec::new();
             let mut selkey_buf = "?.".encode_utf16().collect::<Vec<_>>();
 
             for (i, item) in model.items.iter().enumerate() {
@@ -78,7 +87,6 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
                 };
                 selkey_widths.push(selkey_width);
                 text_widths.push(text_width);
-                comment_widths.push(comment_width);
 
                 let item_width = selkey_width + text_width + comment_width + 2.0 * padding_x;
                 item_widths.push(item_width);
@@ -99,7 +107,6 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
                     item_widths: Vec::new(),
                     selkey_widths: Vec::new(),
                     text_widths: Vec::new(),
-                    comment_widths: Vec::new(),
                     menu_button: None,
                 });
             }
@@ -139,9 +146,8 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
                 max_row_width = max_row_width.max(row_width);
             }
 
-            let rows = (items_len / cand_per_row as f32).ceil().max(1.0);
+            let rows = row_count(model.items.len(), cand_per_row);
             let bar_height = rows * item_height + (rows - 1.0) * ROW_SPACING + 2.0 * MARGIN;
-
             // 面板仅在横向布局且有候选时展开（与 macOS 一致，竖排无菜单按钮入口）。
             // 面板高度按页面取（「剪切板」子页比菜单页高）。
             let panel_height = panel_page.filter(|_| model.horizontal).map(panel_extra_height);
@@ -165,7 +171,6 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
                 item_widths,
                 selkey_widths,
                 text_widths,
-                comment_widths,
                 menu_button,
             })
         }
@@ -232,8 +237,41 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
                 item_widths: vec![root_width],
                 selkey_widths: vec![letter_width],
                 text_widths: vec![root_width],
-                comment_widths: vec![],
                 menu_button: None,
             })
         }
     }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 行数必须永远有限：`cand_per_row` 是用户配置来的，0 会让除法变成 `inf`，
+    /// 而 `bar_height` / `hw_height` 会一路跟着变成 `inf`（窗口尺寸就废了）。
+    #[test]
+    fn row_count_never_divides_by_zero() {
+        // 0 列 = 按 1 列处理，不是崩溃、也不是 inf。
+        assert_eq!(row_count(5, 0), 5.0);
+        assert_eq!(row_count(1, 0), 1.0);
+        assert!(row_count(5, 0).is_finite());
+    }
+
+    /// 常规分页：正好整除、有余数、单列。
+    #[test]
+    fn row_count_matches_page_size() {
+        assert_eq!(row_count(5, 5), 1.0);
+        assert_eq!(row_count(6, 5), 2.0);
+        assert_eq!(row_count(10, 5), 2.0);
+        assert_eq!(row_count(5, 1), 5.0);
+        assert_eq!(row_count(9, 3), 3.0);
+    }
+
+    /// 极端值不能溢出成 inf / NaN（`usize::MAX` 列只是「一行全放下」）。
+    #[test]
+    fn row_count_is_finite_for_extreme_inputs() {
+        assert!(row_count(usize::MAX, usize::MAX).is_finite());
+        assert!(row_count(usize::MAX, 1).is_finite());
+        assert_eq!(row_count(3, usize::MAX), 1.0);
+    }
+}

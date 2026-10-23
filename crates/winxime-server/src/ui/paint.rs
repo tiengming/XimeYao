@@ -1,6 +1,6 @@
 //! 候选栏与字根提示的 Direct2D 绘制。
 
-use tracing::info;
+use tracing::trace;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D_RECT_F, D2D_SIZE_F,
 };
@@ -75,19 +75,12 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
             view.d2d_context.BeginDraw();
 
             let blur_radius = BLUR_RADIUS;
-            let corner_radius = 8.0;
+            let corner_radius = model.corner_radius;
             let key_bg_corner_radius = 4.0;
 
-            let bg_brush = view.d2d_context
-                .CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 0.98,
-                        g: 0.98,
-                        b: 0.98,
-                        a: 1.0,
-                    },
-                    None,
-                )
+            let bg_brush = view
+                .d2d_context
+                .CreateSolidColorBrush(&model.bg_color, None)
                 .map_err(|e| format!("CreateSolidColorBrush bg failed: {:?}", e))?;
 
             let border_brush = view.d2d_context
@@ -122,16 +115,9 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 .CreateSolidColorBrush(&model.primary_color, None)
                 .map_err(|e| format!("CreateSolidColorBrush key_text failed: {:?}", e))?;
 
-            let root_text_brush = view.d2d_context
-                .CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 0.2,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    },
-                    None,
-                )
+            let root_text_brush = view
+                .d2d_context
+                .CreateSolidColorBrush(&model.fg_color, None)
                 .map_err(|e| format!("CreateSolidColorBrush root_text failed: {:?}", e))?;
 
             draw_drop_shadow(
@@ -157,7 +143,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
             view.d2d_context
                 .DrawRoundedRectangle(&bg_rounded_rect, &border_brush, 2.0, None);
 
-            let letter_width = metrics.selkey_widths.get(0).copied().unwrap_or(20.0);
+            let letter_width = metrics.selkey_widths.first().copied().unwrap_or(20.0);
             let key_bg_width = letter_width + 16.0;
             let key_bg_height = 24.0;
             let x_start = blur_radius + 12.0;
@@ -235,6 +221,9 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
         on_paint_with_metrics(view, model, dpi, &metrics, panel, list, grid, voice)
     }
 
+    // 8 个参数＝绘制上下文 + 模型/度量 + 三份可选页面状态；收成结构体要连带
+    // 改调用链，属技术债 D（巨函数拆分）范围，这里先放行。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_paint_with_metrics(
         view: &RenderedView,
         model: &CandidateModel,
@@ -246,11 +235,17 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
         voice: &VoiceView,
     ) -> Result<(), String> {
         unsafe {
-            info!(
-                "on_paint: dpi={}, width={}, height={}, hw_width={}, hw_height={}",
-                dpi, metrics.width, metrics.height, metrics.hw_width, metrics.hw_height
+            // 每帧都会走到这里：用 trace!（默认 info 级别下不格式化、无开销），
+            // 排查排版时 `RUST_LOG=trace` 再打开。
+            trace!(
+                "on_paint: dpi={}, width={}, height={}, hw={}x{}, item_widths={:?}",
+                dpi,
+                metrics.width,
+                metrics.height,
+                metrics.hw_width,
+                metrics.hw_height,
+                metrics.item_widths
             );
-            info!("on_paint: item_widths={:?}", metrics.item_widths);
 
             view.d2d_context.SetTarget(None);
             view.swapchain
@@ -281,7 +276,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
             view.d2d_context.BeginDraw();
 
             let blur_radius = BLUR_RADIUS;
-            let corner_radius = 10.0;
+            let corner_radius = model.corner_radius;
 
             let bg_brush = view.d2d_context
                 .CreateSolidColorBrush(&model.bg_color, None)
@@ -353,18 +348,16 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 let item_width = metrics.item_widths.get(i).copied().unwrap_or(60.0);
                 let selkey_width = metrics.selkey_widths.get(i).copied().unwrap_or(20.0);
                 let text_width = metrics.text_widths.get(i).copied().unwrap_or(40.0);
-                let comment_width = metrics.comment_widths.get(i).copied().unwrap_or(0.0);
 
-                info!(
-                    "  item {}: x={}, item_width={}, text='{}'",
-                    i, x, item_width, item
+                // 每个候选一条：同样只在 trace 级别输出。
+                trace!(
+                    "  item {}: x={}, item_width={}, right={}, text='{}'",
+                    i,
+                    x,
+                    item_width,
+                    x + item_width,
+                    item
                 );
-                info!(
-                    "  bg_rect: left={}, right={}",
-                    blur_radius,
-                    metrics.width + blur_radius
-                );
-                info!("  item_right={}", x + item_width);
 
                 let selkey_rect = D2D_RECT_F {
                     left: x + padding_x,

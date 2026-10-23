@@ -1,6 +1,6 @@
 //! 候选栏窗口：窗口/交换链/合成设备创建与全部消息处理（含菜单面板鼠标交互）。
 
-use tracing::{debug, info};
+use tracing::{debug, trace};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -273,7 +273,7 @@ impl RenderedView {
                     let ctx = Box::from_raw(ctx_ptr);
                     debug!("ctx.candidates: {} items", ctx.candidates.candies.len());
                     let model = CandidateModel::from(&*ctx);
-                    info!("  model.items: {:?}", model.items);
+                    trace!("model.items: {:?}", model.items);
 
                     let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                     if !this_ptr.is_null() {
@@ -288,18 +288,17 @@ impl RenderedView {
                         let view = (*this_ptr).view.borrow();
                         if let Some(view) = view.as_ref() {
                             let dpi = RenderedView::get_dpi_for_window(hwnd);
-                            info!("  DPI: {}", dpi);
                             if let Ok(metrics) = calculate_client_rect(&view.dwrite_factory, &model, dpi, None) {
                                 (*this_ptr).metrics.replace(Some(metrics.clone()));
-                                info!(
-                                    "  metrics.width: {}, metrics.height: {}",
-                                    metrics.width, metrics.height
+                                trace!(
+                                    "候选栏布局: dpi={}, dip={}x{}, hw={}x{}, item_widths={:?}",
+                                    dpi,
+                                    metrics.width,
+                                    metrics.height,
+                                    metrics.hw_width,
+                                    metrics.hw_height,
+                                    metrics.item_widths
                                 );
-                                info!(
-                                    "  metrics.hw_width: {}, metrics.hw_height: {}",
-                                    metrics.hw_width, metrics.hw_height
-                                );
-                                info!("  metrics.item_widths: {:?}", metrics.item_widths);
                                 let _ = SetWindowPos(
                                     hwnd,
                                     Some(HWND_TOPMOST),
@@ -325,7 +324,7 @@ impl RenderedView {
                             }
                         }
                     }
-                    info!("  update complete");
+                    trace!("候选栏更新完成");
                 }
                 LRESULT(0)
             }
@@ -418,14 +417,14 @@ impl RenderedView {
                 LRESULT(0)
             }
             WM_PAINT => {
-                info!("WM_PAINT received");
+                trace!("WM_PAINT received");
                 let mut ps = PAINTSTRUCT::default();
                 BeginPaint(hwnd, &mut ps);
 
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
                     let model = (*this_ptr).model.borrow();
-                    info!("  painting {} items", model.items.len());
+                    trace!("  painting {} items", model.items.len());
                     if !model.items.is_empty() {
                         let view = (*this_ptr).view.borrow();
                         if let Some(view) = view.as_ref() {
@@ -522,10 +521,7 @@ impl RenderedView {
                                     // 既没有子页也没有动作的卡片：现在 6 张卡片都能落到
                                     // 「开子页」或「设置」上，这里是给以后新增卡片的兜底——
                                     // 给一句明确反馈并收起面板，不做「点了没反应」的死卡片。
-                                    crate::toast::show_toast(
-                                        "曦码·曜输入法",
-                                        &format!("「{label}」功能暂未开放"),
-                                    );
+                                    crate::notify::notify(format!("「{label}」功能暂未开放"));
                                     this.collapse_panel();
                                     Self::relayout_and_repaint(this, hwnd);
                                 }
@@ -576,7 +572,7 @@ impl RenderedView {
                                     } else {
                                         "上屏失败：剪贴板被其他程序占用，请重试".to_string()
                                     };
-                                    crate::toast::show_toast("曦码·曜输入法", &body);
+                                    crate::notify::notify(body);
                                 }
                             }
                             Some(PanelHit::PrevPage) => {
@@ -640,7 +636,7 @@ impl RenderedView {
                                     } else {
                                         "上屏失败：剪贴板被其他程序占用，请重试".to_string()
                                     };
-                                    crate::toast::show_toast("曦码·曜输入法", &body);
+                                    crate::notify::notify(body);
                                 }
                             }
                             None => {}
@@ -774,7 +770,7 @@ impl RenderedView {
                             metrics.as_ref().and_then(|m| m.menu_button)
                         };
                         let (panel_width, bar_height, panel_height) = panel_metrics(this);
-                        let over_interactive = menu_btn.map_or(false, |rect| {
+                        let over_interactive = menu_btn.is_some_and(|rect| {
                             rect_contains(rect, px - BLUR_RADIUS, py - BLUR_RADIUS)
                         }) || window_to_panel(
                             BLUR_RADIUS,
@@ -784,7 +780,7 @@ impl RenderedView {
                             px,
                             py,
                         )
-                        .map_or(false, |(lx, ly)| {
+                        .is_some_and(|(lx, ly)| {
                             let list = this.panel_list.borrow();
                             let grid = this.panel_grid.borrow();
                             panel_hit(this.panel_page.get(), panel_width, &list, &grid, lx, ly)

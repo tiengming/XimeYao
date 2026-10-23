@@ -135,7 +135,7 @@ impl Capture {
             if frames > 0 {
                 if silent || data.is_null() {
                     // 静音包：喂等长零样本，保持时间轴连续（端点检测靠它判停顿）。
-                    out.extend(std::iter::repeat(0.0f32).take(frames as usize));
+                    out.extend(std::iter::repeat_n(0.0f32, frames as usize));
                 } else {
                     let bytes = frames as usize
                         * self.channels as usize

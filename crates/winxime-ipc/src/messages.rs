@@ -6,18 +6,12 @@ pub struct Position {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Text {
     pub str: String,
 }
 
-impl Default for Text {
-    fn default() -> Self {
-        Self { str: String::new() }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CandidateInfo {
     pub current_page: u32,
     pub total_pages: u32,
@@ -28,38 +22,14 @@ pub struct CandidateInfo {
     pub labels: Vec<Text>,
 }
 
-impl Default for CandidateInfo {
-    fn default() -> Self {
-        Self {
-            current_page: 0,
-            total_pages: 0,
-            highlighted: 0,
-            is_last_page: false,
-            candies: Vec::new(),
-            comments: Vec::new(),
-            labels: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Context {
     pub preedit: Text,
     pub commit: Option<String>,
     pub candidates: CandidateInfo,
 }
 
-impl Default for Context {
-    fn default() -> Self {
-        Self {
-            preedit: Text::default(),
-            commit: None,
-            candidates: CandidateInfo::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Status {
     pub schema_name: String,
     pub schema_id: String,
@@ -70,18 +40,6 @@ pub struct Status {
     /// 逐字段字面量。
     #[serde(default)]
     pub speech: Option<SpeechStatus>,
-}
-
-impl Default for Status {
-    fn default() -> Self {
-        Self {
-            schema_name: String::new(),
-            schema_id: String::new(),
-            ascii_mode: false,
-            composing: false,
-            speech: None,
-        }
-    }
 }
 
 /// 语音状态快照（设置页「语音转文本」区的一屏数据）。
@@ -160,6 +118,9 @@ pub struct SpeechModel {
 #[serde(rename_all = "snake_case")]
 pub enum IpcCommand {
     Echo,
+    /// 只读状态（当前方案 / 中英态 / 组词状态），不动引擎、不开会话。
+    /// 设置页用它把「当前方案」标到真正在用的那一行。
+    GetStatus,
     StartSession,
     EndSession,
     ProcessKeyEvent,
@@ -206,13 +167,6 @@ pub enum IpcCommand {
     SelectSchema,
     ShowRoot,
     HideRoot,
-    // Schema marketplace
-    FetchSchemaIndex,
-    DownloadSchema,
-    InstallSchema,
-    UninstallSchema,
-    ListMarketSchemas,
-    ListInstalledPackages,
     // 语音（本地离线模型）：设置页的「语音转文本」区驱动 server 侧的语音引擎。
     /// 读语音状态：当前模型 / 可管理模型列表 / 下载进度 / 引擎状态。
     GetSpeechStatus,
@@ -226,6 +180,22 @@ pub enum IpcCommand {
     SpeechTestStart,
     /// 试听结束：停止并**不上屏**（设置页试听不该往用户光标处塞文本）。
     SpeechTestStop,
+}
+
+impl IpcCommand {
+    /// 是不是「单向」命令：客户端只写、服务端**不回包**，两边必须同时遵守。
+    ///
+    /// 协议是「NUL 结尾的 JSON，一问一答」，请求和应答靠**顺序**配对、没有请求 id。
+    /// 所以回包命令一旦被当成单向（服务端多写了没人读，或者客户端不读而服务端写了），
+    /// 那条应答就会留在管道里，被下一条请求读成自己的应答——候选词/上屏文本串位，
+    /// 而且完全不报错。新增单向命令必须同时改这里、服务端 `handle_connection` 的
+    /// 跳过分支和客户端 [`crate::IpcClient::send_no_reply`] 的调用点。
+    ///
+    /// 目前只有位置上报：它每次按键都发，坐标是「尽力而为」，等应答纯属浪费一个
+    /// 完整往返。
+    pub fn is_one_way(&self) -> bool {
+        matches!(self, Self::UpdateInputPosition)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,9 +215,6 @@ pub enum IpcRequestData {
     ChangePage(bool),
     SelectSchema(String),
     ShowRoot(char),
-    SchemaDownload(SchemaDownloadRequest),
-    SchemaInstall(SchemaInstallRequest),
-    SchemaUninstall(SchemaUninstallRequest),
     /// 词典管理：用户词典名（BackupUserDict）。
     UserDict(String),
     /// 词典管理：快照文件路径（RestoreUserDict）。
@@ -300,8 +267,6 @@ pub struct IpcResponse {
     #[serde(default)]
     pub schema_list: Option<Vec<SchemaInfo>>,
     #[serde(default)]
-    pub market_response: Option<SchemaMarketResponse>,
-    #[serde(default)]
     pub dict_response: Option<DictResponse>,
     /// 方案词表读取响应（ListSchemaEntries）。
     #[serde(default)]
@@ -309,6 +274,30 @@ pub struct IpcResponse {
     /// 快捷短语响应（ListCustomPhrases / SaveCustomPhrases）。
     #[serde(default)]
     pub phrase_response: Option<CustomPhraseResponse>,
+}
+
+impl IpcResponse {
+    /// 成功响应骨架：只填 `success`/`session_id`，其余字段留空。
+    ///
+    /// 处理分支里通常只关心一两个字段（`status` / `dict_response` / …），
+    /// 用 `IpcResponse { status: Some(..), ..IpcResponse::ok(id) }` 补即可，
+    /// 不必每次重复写全 8 个字段。
+    pub fn ok(session_id: u32) -> Self {
+        Self {
+            success: true,
+            session_id,
+            ..Default::default()
+        }
+    }
+
+    /// 失败响应骨架（字段布局同 [`Self::ok`]）。
+    pub fn fail(session_id: u32) -> Self {
+        Self {
+            success: false,
+            session_id,
+            ..Default::default()
+        }
+    }
 }
 
 /// 词典管理响应（对齐 weasel DictManagementDialog 的操作结果）。
@@ -409,38 +398,44 @@ pub struct CustomPhraseResponse {
     pub entries: Vec<CustomPhraseEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchemaDownloadRequest {
-    pub schema_id: String,
-    pub url: String,
-    pub sha256: Option<String>,
-    pub filename: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchemaInstallRequest {
-    pub schema_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchemaUninstallRequest {
-    pub schema_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
-pub enum SchemaMarketResponse {
-    Index(String),
-    DownloadDone(String),
-    InstallDone(String),
-    UninstallDone(String),
-    PackageList(Vec<String>),
-    InstalledList(Vec<String>),
-    Error(String),
-}
-
 pub const IPC_PIPE_NAME: &str = "WinximeNamedPipe";
 
 pub fn get_pipe_path() -> String {
     format!("\\\\.\\pipe\\{}", IPC_PIPE_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpcCommand;
+
+    /// 单向命令（服务端不回包）只允许是位置上报。
+    ///
+    /// 这个测试的主要作用是**反向约束**：回包命令一旦被登记成单向，服务端就不写应答，
+    /// 客户端却还在等；反过来（登记漏了）则应答堆在管道里被下一条请求读走。
+    /// 两种都是静默串位，编译期看不出来，只能靠这条守住。
+    #[test]
+    fn only_position_update_is_one_way() {
+        assert!(IpcCommand::UpdateInputPosition.is_one_way());
+        // 典型的回包命令：按键、会话、开关、退出、配置、语音状态。
+        for command in [
+            IpcCommand::Echo,
+            IpcCommand::GetStatus,
+            IpcCommand::StartSession,
+            IpcCommand::EndSession,
+            IpcCommand::ProcessKeyEvent,
+            IpcCommand::FocusIn,
+            IpcCommand::FocusOut,
+            IpcCommand::ToggleAsciiMode,
+            IpcCommand::ShutdownServer,
+            IpcCommand::ReloadConfig,
+            IpcCommand::SyncUserData,
+            IpcCommand::ShowToast,
+            IpcCommand::GetSpeechStatus,
+        ] {
+            assert!(
+                !command.is_one_way(),
+                "{command:?} 会回包，不能登记成单向命令"
+            );
+        }
+    }
 }

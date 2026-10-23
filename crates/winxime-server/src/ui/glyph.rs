@@ -135,13 +135,13 @@ pub(crate) fn items_on_page(
 /// 越界（标签/页/格）返回 `None`——绘制与命中共用，空槽既不画也点不到。
 ///
 /// `recent` 里取出的是借来的 `&str`；内置表是 `'static`，会自然收窄到同一生命周期。
-pub(crate) fn item_at<'a>(
+pub(crate) fn item_at(
     kind: GlyphKind,
     tab: usize,
     page: usize,
     slot: usize,
-    recent: &'a [String],
-) -> Option<&'a str> {
+    recent: &[String],
+) -> Option<&str> {
     if slot >= PER_PAGE {
         return None;
     }
@@ -247,7 +247,8 @@ mod tests {
     #[test]
     fn only_the_symbol_page_needs_a_paging_bar() {
         // 「最近使用」上限就是一页容量，任何页都不可能靠它翻页。
-        assert!(crate::recent_usage::MAX_COUNT <= PER_PAGE);
+        // 两个都是常量，写成编译期断言：改坏了直接编译失败，不用等测试跑。
+        const _: () = assert!(crate::recent_usage::MAX_COUNT <= PER_PAGE);
         // 表情每类恰好 32 个（正好一页）→ 表情页没有翻页条，底部整行留给标签栏。
         assert!(!GlyphKind::Emoji.needs_paging());
         for category in GlyphKind::Emoji.categories() {

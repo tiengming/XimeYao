@@ -92,6 +92,12 @@ fn yaml_str(value: &serde_yaml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// 测试数据根（统一走 `test_support`，见其模块注释）。
+    fn temp_dir(label: &str) -> PathBuf {
+        crate::test_support::test_root(&format!("switches_{label}"))
+    }
 
     const SAMPLE: &str = r#"
 schema:
@@ -133,17 +139,13 @@ switches:
 
     #[test]
     fn read_schema_switches_missing_files_returns_empty() {
-        let dir = std::env::temp_dir().join(format!("xime_switches_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("missing");
         assert!(read_schema_switches(&dir, "nonexistent").is_empty());
     }
 
     #[test]
     fn read_schema_switches_reads_deployed_file() {
-        let dir = std::env::temp_dir().join(format!("xime_switches_rd_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("deployed");
         std::fs::write(dir.join("wubi86.schema.yaml"), SAMPLE).unwrap();
         let switches = read_schema_switches(&dir, "wubi86");
         assert_eq!(switches.len(), 4);

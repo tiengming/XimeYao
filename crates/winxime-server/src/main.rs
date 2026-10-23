@@ -6,11 +6,11 @@ mod context;
 mod custom_phrase;
 mod ipc_server;
 mod models;
+mod notify;
 mod paste;
 mod plugins;
 mod recent_usage;
 mod register;
-mod schema_manager;
 mod schema_switches;
 mod speech;
 mod toast;
@@ -19,6 +19,9 @@ mod ui;
 mod user_dict;
 mod schema_dict;
 
+#[cfg(test)]
+mod test_support;
+
 use crate::context::SharedInputContext;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use tracing::{error, info, warn};
 use windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
 use winxime_ipc::{check_server_running, IpcClient};
 use xime_config::{
-    init_logging_with_console, set_app_metadata, AppMetadata, SchemaManifest, XimeConfig,
+    init_logging_with_console, set_app_metadata, AppMetadata, SchemaManifest,
 };
 use xime_rime::RimeEngine;
 
@@ -47,8 +50,19 @@ fn main() {
         );
     }
 
+    // 日志级别：让 `xime.yaml` 的 `log_level` 真正生效（xime-config 的 init_logging
+    // 只认 `RUST_LOG`，配置项没人读）。必须放在 init 之前。
+    apply_log_level_from_config();
+
     init_logging_with_console("server");
     info!("Server starting");
+    // 出现「配置改了没反应」时，先看这行：设置页写的是哪个文件、文件到底在不在。
+    let config_path = xime_config::XimeConfig::config_path();
+    info!(
+        "Config file: {} (exists={})",
+        config_path.display(),
+        config_path.exists()
+    );
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|arg| arg == "/q" || arg == "/quit") {
@@ -108,7 +122,10 @@ fn main() {
         speech::provider_label()
     );
 
-    let config = XimeConfig::load();
+    let config = crate::config::get();
+    // 候选数量 = 每页显示几个：rime 的 `menu/page_size` 必须 ≥ 它，否则拉不到那么多候选。
+    // 写在部署**之前**，本次启动的部署就会带上。
+    sync_rime_page_size(&user_data_dir, config.style.candidate_count);
     let engine = match RimeEngine::new(&shared_data_dir, &user_data_dir, "Xime Yao") {
         Ok(mut e) => {
             e.set_option("_horizontal", config.style.horizontal);
@@ -133,6 +150,16 @@ fn main() {
                 } else {
                     info!("Previously selected schema '{}' not available", id);
                 }
+            }
+
+            // 部署完核对一次：方案自己写死的 `menu.page_size` 会压过我们的设置，
+            // 日志里要说清楚（否则用户只看到"候选数量不生效"）。
+            if let Some(id) = e.get_current_schema() {
+                warn_if_schema_overrides_page_size(
+                    &user_data_dir,
+                    &id,
+                    config.style.candidate_count.clamp(1, 10) as usize,
+                );
             }
 
             if let Some(status) = e.get_status() {
@@ -176,7 +203,11 @@ fn get_data_dirs() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBu
     #[cfg(debug_assertions)]
     {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_dir = manifest_dir.parent().unwrap().parent().unwrap();
+        let workspace_dir = manifest_dir
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| manifest_dir.clone());
         (
             workspace_dir.join("rime-wubi"),
             workspace_dir.join("target").join("debug").join("user-data"),
@@ -345,7 +376,7 @@ fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) {
         for entry in entries.flatten() {
             let ft = entry.file_type().ok();
             let dest = dst.join(entry.file_name());
-            if ft.map_or(false, |t| t.is_dir()) {
+            if ft.is_some_and(|t| t.is_dir()) {
                 let _ = std::fs::create_dir_all(&dest);
                 copy_dir_recursive(&entry.path(), &dest);
             } else {
@@ -360,7 +391,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
         for entry in entries.flatten() {
             let ft = entry.file_type().ok();
             let dest = dst.join(entry.file_name());
-            if ft.map_or(false, |t| t.is_dir()) {
+            if ft.is_some_and(|t| t.is_dir()) {
                 let _ = std::fs::create_dir_all(&dest);
                 copy_dir_recursive(&entry.path(), &dest);
             } else {
@@ -400,25 +431,6 @@ fn run_server(
     let ascii_mode = Arc::new(AtomicBool::new(false));
     let main_thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
-    // Determine market directory alongside user data（与 rime 用户目录同级的 market/）
-    let market_dir = user_data_dir.parent().map_or_else(
-        || {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("market")
-        },
-        |parent| parent.join("market"),
-    );
-    let _ = std::fs::create_dir_all(&market_dir);
-    info!("Market directory: {}", market_dir.display());
-
-    let schema_mgr = Arc::new(schema_manager::SchemaManager::new(
-        market_dir,
-        user_data_dir.clone(),
-    ));
-
     info!("Creating UI window...");
     let window = ui::CandidateWindow::new();
     info!("UI window created");
@@ -452,7 +464,6 @@ fn run_server(
     let context_clone = context.clone();
     let window_clone = window.clone();
     let ascii_mode_clone = ascii_mode.clone();
-    let schema_mgr_clone = schema_mgr.clone();
     let plugin_host_for_ipc = plugin_host.clone();
     std::thread::spawn(move || {
         ipc_server::run_ipc_server(
@@ -461,7 +472,6 @@ fn run_server(
             window_clone,
             ascii_mode_clone,
             main_thread_id,
-            schema_mgr_clone,
             plugin_host_for_ipc,
         );
     });
@@ -489,8 +499,10 @@ fn run_server(
                 std::thread::spawn(|| {
                     if winxime_ipc::IpcClient::sync_user_data() {
                         info!("用户资料同步完成（托盘触发）");
+                        crate::notify::notify("用户资料同步完成");
                     } else {
                         error!("用户资料同步失败（托盘触发）");
+                        crate::notify::notify("用户资料同步失败，详见 server.log");
                     }
                 });
             }
@@ -532,13 +544,29 @@ fn run_server(
     let engine_for_switches = engine.clone();
     let rime_dir_for_switches = user_data_dir.clone();
     let switch_provider: tray::SwitchProvider = Arc::new(move || {
+        // 第一次拿锁只问「当前是哪个方案」，问完立刻放开：`read_schema_switches` 是
+        // 整份 `<id>.schema.yaml` 的 read + `serde_yaml` 解析，持锁做的话，菜单弹出
+        // 期间所有键事件 `try_lock` 都失败（键被丢，而且看起来像输入法卡死）。
+        let schema_id = {
+            let Ok(eng) = engine_for_switches.try_lock() else {
+                return Vec::new();
+            };
+            let Some(schema_id) = eng.get_current_schema() else {
+                return Vec::new();
+            };
+            schema_id
+        };
+
+        let switches =
+            crate::schema_switches::read_schema_switches(&rime_dir_for_switches, &schema_id);
+
+        // 第二次拿锁读各开关的当前取值：只有几次 `get_option`，不碰 IO。
+        // 两次拿锁之间用户理论上可能切了方案；菜单是瞬时的，用旧方案的开关列表
+        // 不影响正确性（点下去是按名字设值）。
         let Ok(eng) = engine_for_switches.try_lock() else {
             return Vec::new();
         };
-        let Some(schema_id) = eng.get_current_schema() else {
-            return Vec::new();
-        };
-        crate::schema_switches::read_schema_switches(&rime_dir_for_switches, &schema_id)
+        switches
             .into_iter()
             // ascii_mode 与顶部「切换中/英」重复，跳过。
             .filter(|sw| sw.name != "ascii_mode")
@@ -576,7 +604,7 @@ fn run_server(
             .collect()
     });
 
-    tray::TrayIcon::new(on_action, switch_provider);
+    tray::TrayIcon::install(on_action, switch_provider);
     info!("Tray icon created");
 
     info!("Starting clipboard listener...");
@@ -608,4 +636,83 @@ fn run_server(
     tray::cleanup();
     speech::SpeechEngine::global_shutdown();
     info!("Server shutdown complete");
+}
+
+/// 把候选栏显示数量同步成 rime 的 `menu/page_size`。
+///
+/// 候选是 librime 一页给的：`style.candidate_count` 调到 7，而 `menu/page_size` 还是
+/// 5，候选栏最多只能显示 5 个——用户看到的就是「候选数量设置不生效」。
+/// 只改这一个键（`default.custom.yaml` 里其它 patch 原样保留），**部署后生效**。
+fn sync_rime_page_size(user_dir: &std::path::Path, candidate_count: i32) {
+    // 上限 10：选字键是 1–9 + 0，再多也没键可选。方案包里如果写死了
+    // `menu.page_size`，它会压过这里的 patch——那种方案需要自己删掉那行
+    // （约定见 xime-docs：候选数量归 xime 管）。
+    let page_size = candidate_count.clamp(1, 10) as usize;
+    match xime_config::set_page_size_in(user_dir, page_size) {
+        Ok(true) => info!("menu/page_size 已对齐到 {page_size}（部署后生效）"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("同步 menu/page_size 失败: {e}"),
+    }
+}
+
+/// 部署后核对：方案的 `menu.page_size` 是否压过了 xime 的候选数量设置。
+///
+/// `menu/page_size` 是**方案级**配置：方案包在自己的 `*.schema.yaml` 里写了 page_size，
+/// 就压过 `default.custom.yaml`（xime 只改默认层）。这时日志必须说清楚是哪一行，
+/// 否则用户只会看到「候选数量设置不生效」。
+fn warn_if_schema_overrides_page_size(
+    user_dir: &std::path::Path,
+    schema_id: &str,
+    wanted: usize,
+) {
+    let path = user_dir.join("build").join(format!("{schema_id}.schema.yaml"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(tree) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return;
+    };
+    let effective = tree
+        .get("menu")
+        .and_then(|menu| menu.get("page_size"))
+        .and_then(|value| value.as_i64());
+    if let Some(size) = effective {
+        if size as usize != wanted {
+            tracing::warn!(
+                "方案 {schema_id} 自己定义了 menu.page_size={size}（期望 {wanted}）：\
+                 候选数量受它限制。删掉 {schema_id}.schema.yaml 里的 menu.page_size 即可\
+                 让 xime 的设置生效。"
+            );
+        }
+    }
+}
+
+/// 把配置里的 `log_level` 翻译成 `RUST_LOG`（环境变量已设置时不动）。
+///
+/// `xime_config::init_logging` 的过滤器写死了「全局 info + 本项目各 crate debug」，
+/// `XimeConfig::log_level` 这个配置项从来没被读过——用户以为改成 trace 有用，其实没用。
+/// 这里在初始化前写进 `RUST_LOG`，`EnvFilter::try_from_default_env()` 就会优先采用它。
+///
+/// 第三方 crate 一律留在 `info`：`trace` 全开会把 librime 的逐键日志也倒进文件，
+/// 反倒把要找的那几行埋掉。级别改动**重启服务后生效**（InitLogger 只能初始化一次）。
+fn apply_log_level_from_config() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return;
+    }
+    let config = xime_config::XimeConfig::load();
+    // 没配就**什么都不做**：`xime_config` 的默认过滤器是「全局 info + 本项目各 crate
+    // debug」，比裸 `info` 信息量大得多，不能因为配置项缺席就把它调低。
+    if config.log_level.is_none() {
+        return;
+    }
+    let level = config.effective_log_level().to_string();
+    let filter = match level.as_str() {
+        "trace" | "debug" => format!(
+            "info,winxime_server={level},winxime_tsf={level},winxime_ipc={level},\
+             xime_config={level},xime_rime={level},xime_setup_lib={level},xime_plugin={level}"
+        ),
+        // error / warn / info 直接当全局指令用。
+        other => other.to_string(),
+    };
+    std::env::set_var("RUST_LOG", filter);
 }

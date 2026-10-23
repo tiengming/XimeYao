@@ -1182,6 +1182,9 @@ fn make_text_format(
 /// 列表子页（剪切板 / 快捷发送）读 `list`（内存快照，见 [`PanelList`]）；
 /// 网格子页（表情 / 符号）读 `grid`（当前标签 / 页 / 最近使用，见 [`PanelGrid`]）
 /// 加内置字形表（见 `ui::glyph`）。
+// 10 个参数都是绘制上下文 + 三份页面数据；收成一个结构体要连带动 `paint`
+// 的调用链，属技术债 D（巨函数拆分）范围，这里先放行。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_panel(
     d2d: &ID2D1DeviceContext,
     dwrite: &IDWriteFactory1,

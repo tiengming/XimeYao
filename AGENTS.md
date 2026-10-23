@@ -16,11 +16,15 @@
 
 ## 硬性规则（必须遵守，CI 会验证）
 - 所有命令使用 powershell
-- 修改完必须使用 `cargo build --quiet` 检查是否有错误
-- 代码中禁止出现`unwarp()` 和 `expect()` 方法
+- 修改完必须使用 `cargo build --quiet` 检查是否有错误；收尾再跑
+  `cargo clippy --workspace --all-targets`（0 warning）与 `cargo test --workspace`
+- 代码中禁止出现`unwarp()` 和 `expect()` 方法（`unwarp` 为原文笔误，实指 `unwrap`）
 - 禁止自己运行程序，禁止自己安装
-- librime 目录只读，禁止修改
-- 禁止提交代码 
+- **librime 源码只读**：不修改 `libximecore/librime` 里任何被跟踪文件。
+  唯一例外是**构建输入**：插件按上游约定放在 `librime/plugins/<name>`（我们用目录联接
+  指向仓库外的 clone，见 README「前置要求」）；`librime/build`、`librime/dist` 本就是
+  构建产物。用完可 `rmdir` 联接回退。
+- 未经用户明确指示，**不要 commit / push**（下班打卡第 3 步只在用户要求时执行）
 
 ## 工作规则
 - 每次只做一个功能点
@@ -36,6 +40,6 @@
 4. 从 PROGRESS.md 的"下一步"部分继续工作
 
 ## 每次会话结束前（下班打卡）
-1. 更新 PROGRESS.md
-2. 跑 `./cargo build --quiet` 确认一致状态
-3. 提交所有已完成的工作
+1. 更新 PROGRESS.md（本次做了什么、验证数据、遗留项）
+2. 跑 `cargo build --quiet` 确认一致状态（必要时再跑 clippy / test）
+3. 与用户确认后再提交（默认不自行 commit / push）

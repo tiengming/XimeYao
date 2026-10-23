@@ -4,7 +4,7 @@
 //! 四件套平铺），**模型清单**在 `xime-speech` 的 [`AsrModelRegistry`]（id/展示名/
 //! 下载地址/文件名角色），本模块只做两件事：
 //!
-//! 1. [`catalog`]：把注册表 + 磁盘现状 + 当前选中合并成设置页要的列表；
+//! 1. `catalog`：把注册表 + 磁盘现状 + 当前选中合并成设置页要的列表；
 //! 2. 下载：注册表给的是 ModelScope 的 `.tar.bz2`，流式下载（带进度）→
 //!    解压时**只取文件名**铺平到 `models/<id>/`（包内有一层顶层目录，
 //!    不留目录结构也是防目录穿越的一条硬防线）。
@@ -276,14 +276,9 @@ fn flattened_name(path: &Path) -> Option<std::ffi::OsString> {
 mod tests {
     use super::*;
 
-    /// 测试用数据根（见 `speech::settings` 测试同一口径：本环境不能在 %TEMP% 建目录）。
+    /// 测试用数据根（统一走 `test_support`，见其模块注释）。
     fn temp_root(label: &str) -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/test-tmp")
-            .join(format!("speech_download_{label}"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::create_dir_all(root.join("rime"));
-        root
+        crate::test_support::test_root(&format!("speech_download_{label}"))
     }
 
     #[test]

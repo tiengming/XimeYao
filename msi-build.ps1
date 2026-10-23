@@ -21,6 +21,23 @@ $ErrorActionPreference = "Stop"
 # Add WiX v3.14 to PATH
 $env:PATH += ";C:\Program Files (x86)\WiX Toolset v3.14\bin"
 
+# clang 也要在 PATH 上：libquickjs-ng-sys 的 build.rs 在 Windows 上硬编码用 clang 编
+# quickjs（LIBCLANG_PATH 只给 bindgen 用，cc 找不到编译器照样失败）。
+$llvmBin = $env:LIBCLANG_PATH
+if ([string]::IsNullOrEmpty($llvmBin)) { $llvmBin = "C:\Program Files\LLVM\bin" }
+if ((Test-Path (Join-Path $llvmBin "clang.exe")) -and -not (($env:PATH -split ';') -contains $llvmBin)) {
+    $env:PATH = "$llvmBin;$env:PATH"
+} elseif (-not (Get-Command clang.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "WARNING: clang.exe not found (libquickjs-ng-sys needs it to build quickjs)." -ForegroundColor Yellow
+}
+
+# 同理：librime-lua 插件不在位时，打出来的 MSI 里 rime.dll 就没有 lua 组件。
+$luaPlugin = Join-Path $PSScriptRoot "..\libximecore\librime\plugins\lua"
+if (-not (Test-Path (Join-Path $luaPlugin "CMakeLists.txt"))) {
+    Write-Host "WARNING: librime-lua 插件未就绪（$luaPlugin 不存在）" -ForegroundColor Yellow
+    Write-Host "  rime.dll 将不含 lua 组件；依赖 lua 的方案会缺功能。" -ForegroundColor Yellow
+}
+
 # CUDA 包：定位 sherpa-onnx 的 CUDA 版运行库目录（build.rs 会从这里取 DLL），
 # 并把 cargo 目标目录切到 target-cuda（与 CPU 包产物隔离，不能混）。
 $TargetDir = "target\release"
@@ -177,6 +194,10 @@ if (Test-Path $msiPath) {
     Write-Host "Size: $([math]::Round($msi.Length / 1MB, 2)) MB" -ForegroundColor White
     Write-Host ""
     Write-Host "Install: msiexec /i $($msi.FullName)" -ForegroundColor Yellow
+    if ($Gpu) {
+        Write-Host "目标机要求：CUDA 13 运行库（cuBLAS）+ cuDNN 9；缺库时语音识别自动回退 CPU。" -ForegroundColor Yellow
+        Write-Host "（本包与 CPU 包不能混装：onnxruntime.dll 同名不同体。详见 README「GPU 加速包」。）" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "MSI build failed!" -ForegroundColor Red
     exit 1

@@ -40,6 +40,21 @@
         <Property Id='DiskPrompt' Value='曦码·曜 Installation'/>
         
         <Property Id='REINSTALLMODE' Value='amus'/>
+
+        <!-- GPU 包的运行库要求写在安装完成的「完成」页上（ExitDialogDescription 里
+             展开 [CUDA_NOTE]）：那是每个安装用户都会看到的一屏，而 WixUI_InstallDir
+             的界面里没有 feature 树可以显示描述。
+             CPU 包只给一个空格（见下方 else 分支的说明）。
+             注意这与 CUDA 运行库的**缺失检测**是两件事：真正的探测在 server 里
+             （speech::cuda_runtime_ready），因为运行库装在 CUDA 的 bin 目录里、
+             靠 PATH 才能找到，MSI 的 FileSearch 探不到，硬做会得出错误结论。 -->
+        <?if $(var.WithCudaDlls) = 1 ?>
+        <Property Id='CUDA_NOTE' Value='本安装包是 GPU 加速版：语音识别还需要 NVIDIA 驱动附带的 CUDA 13 运行库（cuBLAS）与 cuDNN 9；缺少时自动改用 CPU，不影响输入法本体。'/>
+        <?else ?>
+        <!-- 不用空串：空值属性在格式化文本里的展开行为不够确定，万一没展开，
+             「完成」页会露出字面的 [CUDA_NOTE]。空格最坏就是多一个空格。 -->
+        <Property Id='CUDA_NOTE' Value=' '/>
+        <?endif ?>
         
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <!-- Start Menu -->

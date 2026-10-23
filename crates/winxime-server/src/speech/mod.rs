@@ -494,11 +494,7 @@ impl Worker {
                 windows::Win32::System::Com::COINIT_MULTITHREADED,
             );
         }
-        loop {
-            let command = match rx.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            };
+        while let Ok(command) = rx.recv() {
             match command {
                 Command::Warmup => self.warmup(),
                 Command::Start => {
@@ -909,15 +905,10 @@ mod tests {
 
     /// 模型就绪判定：**选中模型**的四个文件齐且非空。
     ///
-    /// 测试目录放在仓库 target/ 下（`%TEMP%` 在某些受限环境里拒绝创建目录，
-    /// 那是 baseline 里 models/schema_switches 测试失败的原因，新测试不跟着踩）。
+    /// 测试数据根统一走 `test_support`（`target/test-tmp/`，见其模块注释）。
     #[test]
     fn model_ready_requires_all_four_files() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join("speech_model_ready");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::test_root("speech_model_ready");
         let rime_user_dir = root.join("rime");
         assert!(
             std::fs::create_dir_all(&rime_user_dir).is_ok(),
