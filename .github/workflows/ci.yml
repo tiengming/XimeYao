@@ -5,6 +5,8 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  # 允许在任意分支手动跑一遍（feature 分支未开 PR 时也能验证打包链路）。
+  workflow_dispatch:
   workflow_call:
     outputs:
       unsigned-msi-id:
@@ -70,17 +72,11 @@ jobs:
       - name: Prepare data & resources for MSI/MSIX
         shell: pwsh
         run: |
-          $json = cargo metadata --format-version 1 | ConvertFrom-Json
-          $pkg = $json.packages | Where-Object { $_.name -eq 'librime-sys2' }
-          $manifestPath = $pkg.manifest_path
-          $libximecoreRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $manifestPath))
-          $librimeRoot = Join-Path $libximecoreRoot "librime"
-
-          # data
+          # data/ 不再分发 librime 自带 minimal 示例（cangjie5 / luna_pinyin 等
+          # 会混入用户 rime 目录，见 DECISIONS 2026-09-30）；rime-wubi 自包含，
+          # 方案文件统一进 user-data/。与 msi-build.ps1 / msix-bundle.ps1 一致。
           if (Test-Path "target\release\data") { Remove-Item "target\release\data" -Recurse -Force }
           New-Item "target\release\data" -ItemType Directory -Force | Out-Null
-          $rimeData = Join-Path $librimeRoot "data\minimal"
-          if (Test-Path $rimeData) { Copy-Item "$rimeData\*" "target\release\data" -Recurse -Force }
 
           $files = Get-ChildItem -Path "rime-wubi" -Recurse -File | Where-Object {
             $d = $_.DirectoryName; $n = $_.Name
@@ -89,12 +85,9 @@ jobs:
             -not ($n -like "*.command") -and -not ($n -like "LICENSE") -and
             -not ($n -like "squirrel.custom.yaml") -and -not ($n -like "trime.custom.yaml")
           }
-          foreach ($f in $files) {
-            $rel = $f.FullName.Substring($PWD.Path.Length + "rime-wubi".Length + 2)
-            $dest = "target\release\data\$rel"
-            $dd = Split-Path -Parent $dest
-            if (-not (Test-Path $dd)) { New-Item $dd -ItemType Directory -Force | Out-Null }
-            Copy-Item $f.FullName $dest -Force
+          if ($files.Count -eq 0) {
+            Write-Error "rime-wubi 子模块为空（checkout 时没拉取？）"
+            exit 1
           }
 
           # user-data: rime-wubi schema files for first-run deploy
@@ -139,8 +132,29 @@ jobs:
           # binaries
           Copy-Item "target\release\winxime-server.exe", "target\release\winxime_tsf.dll", "target\release\winxime-setup.exe", "target\release\winxime-tsf-register.exe", "target\release\rime.dll" $packageDir
 
-          # data & resources
-          Copy-Item "target\release\data\*" "$packageDir\data" -Recurse -Force
+          # 语音运行库：server 的导入表直接引用 sherpa-onnx-c-api.dll，缺了起不来。
+          # 与 msix-bundle.ps1 Step 1.5 保持一致；缺 mandatory 直接失败而不是
+          # 打出一个装完起不来的包。
+          $mandatoryDlls = @("sherpa-onnx-c-api.dll", "onnxruntime.dll")
+          $optionalDlls = @(
+            "onnxruntime_providers_shared.dll",
+            "sherpa-onnx-cxx-api.dll",
+            "onnxruntime_providers_cuda.dll"
+          )
+          foreach ($dll in $mandatoryDlls) {
+            $src = "target\release\$dll"
+            if (-not (Test-Path $src)) { Write-Error "语音运行库缺失：$src"; exit 1 }
+            Copy-Item $src $packageDir
+          }
+          foreach ($dll in $optionalDlls) {
+            $src = "target\release\$dll"
+            if (Test-Path $src) { Copy-Item $src $packageDir }
+          }
+
+          # 方案文件进 user-data/（首次启动部署到 %APPDATA%）；data/ 保持空，
+          # 与 msi-build.ps1 / msix-bundle.ps1 的打包语义一致。
+          New-Item "$packageDir\user-data" -ItemType Directory -Force | Out-Null
+          Copy-Item "target\release\user-data\*" "$packageDir\user-data" -Recurse -Force
           Copy-Item "target\release\resources\*" "$packageDir\resources" -Recurse -Force
 
           # logos & manifest
