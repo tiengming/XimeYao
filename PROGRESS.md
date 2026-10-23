@@ -2944,3 +2944,9 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
   避免 CPU 包引用不存在的组件。
 - **验证**：静态检查 13 个 Component / 13 个 ComponentRef，无未引用组件、无悬空引用；
   本机是 Linux（无 WiX/light），实际打包需以 Windows CI 结果为准。
+- **工作流同步修复**（`ci.yml`）：
+  - MSIX 步骤漏拷语音运行库（`sherpa-onnx-c-api.dll` / `onnxruntime.dll` 等），
+    打出的包装完 server 起不来；已对齐 `msix-bundle.ps1`，缺 mandatory DLL 直接失败。
+  - CI 的 `data/` 仍夹带 librime minimal 示例、方案文件同时写进 data 和 user-data；
+    已对齐 `msi-build.ps1` / `msix-bundle.ps1`：`data/` 置空、rime-wubi 只进 `user-data/`。
+  - 增加 `workflow_dispatch`，未开 PR 的 feature 分支也能手动跑完整打包链路。
