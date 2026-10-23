@@ -2948,5 +2948,11 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
   - MSIX 步骤漏拷语音运行库（`sherpa-onnx-c-api.dll` / `onnxruntime.dll` 等），
     打出的包装完 server 起不来；已对齐 `msix-bundle.ps1`，缺 mandatory DLL 直接失败。
   - CI 的 `data/` 仍夹带 librime minimal 示例、方案文件同时写进 data 和 user-data；
-    已对齐 `msi-build.ps1` / `msix-bundle.ps1`：`data/` 置空、rime-wubi 只进 `user-data/`。
+    已对齐 `msi-build.ps1` / `msix-bundle.ps1`：rime-wubi 只进 `user-data/`。
+  - **实测补充（workflow_dispatch 首跑）**：`data/` 置空后 `heat` 报 HEAT5053
+    （empty directories are not being kept）且**不覆盖**仓库里旧的 `data.wxs`，
+    `light` 随后拿旧清单报几十个 LGHT0103。`data/` 按设计本就不分发任何文件，
+    因此彻底移除 DataFiles：删 `data.wxs`、`main.wxs` 去掉 `DataFolder`/`DataFiles`，
+    `ci.yml` / `msi-build.ps1` 不再 heat data、candle/light 不再传 `data.wxs`；
+    `msix-bundle.ps1` 也不再创建空的 package/data。heat 失败改为显式退出。
   - 增加 `workflow_dispatch`，未开 PR 的 feature 分支也能手动跑完整打包链路。

@@ -69,15 +69,12 @@ jobs:
           Copy-Item $rimeDll "target\release\rime.dll" -Force
           Write-Host "Copied rime.dll to target\release\"
 
-      - name: Prepare data & resources for MSI/MSIX
+      - name: Prepare user-data & resources for MSI/MSIX
         shell: pwsh
         run: |
-          # data/ 不再分发 librime 自带 minimal 示例（cangjie5 / luna_pinyin 等
-          # 会混入用户 rime 目录，见 DECISIONS 2026-09-30）；rime-wubi 自包含，
-          # 方案文件统一进 user-data/。与 msi-build.ps1 / msix-bundle.ps1 一致。
-          if (Test-Path "target\release\data") { Remove-Item "target\release\data" -Recurse -Force }
-          New-Item "target\release\data" -ItemType Directory -Force | Out-Null
-
+          # 不再分发 librime 自带 minimal 示例（cangjie5 / luna_pinyin 等会混入
+          # 用户 rime 目录，见 DECISIONS 2026-09-30）；rime-wubi 自包含，方案文件
+          # 统一进 user-data/。与 msi-build.ps1 / msix-bundle.ps1 一致。
           $files = Get-ChildItem -Path "rime-wubi" -Recurse -File | Where-Object {
             $d = $_.DirectoryName; $n = $_.Name
             -not ($d -like "*\.git*") -and -not ($d -like "*\.github*") -and -not ($d -like "*imgs*") -and
@@ -112,11 +109,10 @@ jobs:
         run: |
           set PATH=%PATH%;"C:\Program Files (x86)\WiX Toolset v3.14\bin"
           if not exist "target\wix" mkdir "target\wix"
-          heat dir "target\release\data" -o "crates\winxime-server\wix\data.wxs" -dr DataFolder -cg DataFiles -var var.DataDir -sreg -srd -ag
-          heat dir "target\release\user-data" -o "crates\winxime-server\wix\user-data.wxs" -dr UserDataFolder -cg UserDataFiles -var var.UserDataDir -sreg -srd -ag
-          heat dir "target\release\resources" -o "crates\winxime-server\wix\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -var var.ResourcesDir -sreg -srd -ag
-          candle -arch x64 "crates\winxime-server\wix\main.wxs" "crates\winxime-server\wix\data.wxs" "crates\winxime-server\wix\user-data.wxs" "crates\winxime-server\wix\resources.wxs" -ext WixUIExtension -ext WixUtilExtension "-dCargoTargetBinDir=target\release" "-dDataDir=target\release\data" "-dUserDataDir=target\release\user-data" "-dResourcesDir=target\release\resources" "-dVersion=%VERSION%" -out "target\wix\\" 2>&1
-          light "target\wix\main.wixobj" "target\wix\data.wixobj" "target\wix\user-data.wixobj" "target\wix\resources.wixobj" -ext WixUIExtension -ext WixUtilExtension -cultures:zh-CN -loc "crates\winxime-server\wix\zh-cn.wxl" -out "target\wix\ximeyao-%VERSION%-x86_64.msi" 2>&1
+          heat dir "target\release\user-data" -o "crates\winxime-server\wix\user-data.wxs" -dr UserDataFolder -cg UserDataFiles -var var.UserDataDir -sreg -srd -ag || exit /b 1
+          heat dir "target\release\resources" -o "crates\winxime-server\wix\resources.wxs" -dr ResourcesFolder -cg ResourcesFiles -var var.ResourcesDir -sreg -srd -ag || exit /b 1
+          candle -arch x64 "crates\winxime-server\wix\main.wxs" "crates\winxime-server\wix\user-data.wxs" "crates\winxime-server\wix\resources.wxs" -ext WixUIExtension -ext WixUtilExtension "-dCargoTargetBinDir=target\release" "-dUserDataDir=target\release\user-data" "-dResourcesDir=target\release\resources" "-dVersion=%VERSION%" -out "target\wix\\" 2>&1
+          light "target\wix\main.wixobj" "target\wix\user-data.wixobj" "target\wix\resources.wixobj" -ext WixUIExtension -ext WixUtilExtension -cultures:zh-CN -loc "crates\winxime-server\wix\zh-cn.wxl" -out "target\wix\ximeyao-%VERSION%-x86_64.msi" 2>&1
 
       - name: Build MSIX
         shell: pwsh
@@ -127,7 +123,7 @@ jobs:
 
           $packageDir = "target\msix-pkg"
           if (Test-Path $packageDir) { Remove-Item $packageDir -Recurse -Force }
-          New-Item "$packageDir\assets", "$packageDir\data", "$packageDir\resources" -ItemType Directory -Force | Out-Null
+          New-Item "$packageDir\assets", "$packageDir\resources" -ItemType Directory -Force | Out-Null
 
           # binaries
           Copy-Item "target\release\winxime-server.exe", "target\release\winxime_tsf.dll", "target\release\winxime-setup.exe", "target\release\winxime-tsf-register.exe", "target\release\rime.dll" $packageDir
