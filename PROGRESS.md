@@ -2930,3 +2930,17 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
    仍待用户目视/真机验证。
 6. **`libximecore` 改动需各端回归**：配置 save/load 语义（差异写入 + 树合并）是共用核心，
    Android/Linux/macOS 客户端需验证「改设置 → 保存 → 重开」与恢复/撤销按钮。
+
+### 2026-10-23 修复 CI：MSI 打包 light ICE21（语音运行库没挂 Feature）
+
+- **现象**：PR #22 及合并后的 main 都在「Build MSI」步骤失败，`light` 返回 204：
+  `ICE21: Component: 'sherpa_dll' / 'sherpa_cxx_dll' / 'onnxruntime_dll' /
+  'onnxruntime_providers_dll' does not belong to any Feature`。
+- **根因**：347e083 为语音（sherpa-onnx）新增了这 4 个 Component，但只定义了
+  `<Component>`，漏了 Binaries Feature 里的 `<ComponentRef>`。此前 CI 在更早的
+  `cargo build`（libximecore `voice` 模块 cfg 问题）就挂了，MSI 这层错误一直没暴露。
+- **修复**：`crates/winxime-server/wix/main.wxs` 的 Binaries Feature 补上 4 个
+  ComponentRef；GPU 包专用的 `onnxruntime_cuda_dll` 放进 `WithCudaDlls` 条件引用，
+  避免 CPU 包引用不存在的组件。
+- **验证**：静态检查 13 个 Component / 13 个 ComponentRef，无未引用组件、无悬空引用；
+  本机是 Linux（无 WiX/light），实际打包需以 Windows CI 结果为准。
