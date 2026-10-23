@@ -108,9 +108,12 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
   两端才能共享方案包与排障结论。
 
 ### 遗留
-- server 侧旧 `schema_manager.rs`（IPC `InstallSchema`/`UninstallSchema`，`packages:` 包裹的
+- ~~server 侧旧 `schema_manager.rs`（IPC `InstallSchema`/`UninstallSchema`，`packages:` 包裹的
   旧注册表格式、只拷 `.schema.yaml`）与设置程序实现重复，当前无 UI 调用入口；待统一到
-  `xime_config::schema_manifest` 或删除。
+  `xime_config::schema_manifest` 或删除。~~
+  → **2026-10-23 已删除**：`schema_manager.rs` 连同 6 个市场 IPC 命令、`SchemaMarketResponse`
+  与 `IpcResponse.market_response` 一并移除；方案包注册表只剩 `xime_config::schema_manifest`
+  一套实现（扁平 `包id -> {files, sha256}`）。
 
 ## 2026-09-30 选中方案的唯一记录：rime 的 user.yaml
 
@@ -841,3 +844,184 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
 - **文本区的语义分档**：实时文本（最大、正文色）/ 已上屏回执（正文色，正常字号）/
   引导语（次级色）/ 错误（红）。**错误信息与"去哪修"分开**：文本区说错在哪，
   底部提示行说去哪里解决（"设置 → 语音转文本：下载模型或检查麦克风"）。
+
+## 2026-10-23 技术债清理：没接线的功能"标注"而不是"删除"
+
+- **云备份簇（插件备份/恢复）保留代码、加 `#[allow(dead_code)]` 并写明原因**：
+  `PluginHost` 的 `backup_now/list_backups/restore_backup/delete_backup` 与打包 helper
+  是完整实现 + 有单测，只是还没有 IPC 命令和设置页入口。删掉等于把"已经想清楚的数据布局"
+  （`rime/` 前缀、`_xime_backup/` 元数据条目、`build/` 不进包）一起丢掉；
+  留着则要能一眼看出"它是故意未接线的"——所以整簇收进独立 impl 加一个 allow，
+  而不是散落 9 个 allow 或者让警告常年挂着。
+- **数据镜像字段同理**：`CompositionInfo.cursor_pos/sel_start/sel_end` 这类来自 TSF 的
+  原始数据，面板暂时只画整串 preedit。删字段会让"TSF 已经给到的信息"在 server 侧丢失，
+  补回来还得同时改 TSF 侧；所以字段级 `#[allow(dead_code)]` + "面板暂未消费"的注释。
+- **反过来，真没人用的东西直接删**：`has_typed_plugin()`、`SharedInputContext` 的
+  `dirty`/`with()`/`is_dirty()`、`RenderedMetrics.comment_widths` 都是"写了没人读"，
+  没有未来用途可解释，删掉就是净收益。
+- **测试夹具必须有唯一入口**：`%TEMP%` 不可写这个坑逼着每个测试模块各写一版目录构造，
+  结果三处口径漂移（两份没带 pid、两份 `unwrap_or_default()` 静默吞错）。统一收到
+  `test_support::test_root()`：带 pid、预建 `rime/`、失败不吞。以后加测试只准用它。
+
+## 2026-10-23 日志分级与巨函数拆分
+
+- **每帧/每次按键都走的日志降级为 `trace!`，而不是删掉**：候选栏的绘制与候选更新在
+  info 级别刷屏，既慢（每帧都要格式化参数）又会把真正的诊断信息淹掉。降级后
+  `RUST_LOG=trace` 时字段一个不少，排查排版问题仍然可用。
+- **失败就要按失败报**：`show()/update()` 投递失败、视图未初始化原来是 `info!`，
+  正常路径看不到、真出问题也不显眼，改 `warn!`；Direct2D 初始化失败改 `error!`。
+- **`DllMain` 里不做文件 I/O、不起线程**：TSF 的日志初始化从 `DllMain` 挪到
+  `DllGetClassObject` / 注册 / 反注册三个入口，用 `Once` 保证只做一次。
+  加载器锁里 `create_dir_all` + `tracing_appender` 起写线程是典型的死锁来源；
+  顺带删掉了 `DllMain` 里那段没被 `init_logging` 使用的 TEMP 路径。
+- **巨函数拆分只做纯搬移，不顺手改逻辑**：`process_request` 拆出 `handle_key_event` /
+  `handle_dict_command` 时一行逻辑没动；搬移用脚本 + 自检（挖掉被搬移区间后两侧代码
+  必须逐字一致），比手工复制可靠，也便于复核 diff。
+- **视觉代码的拆分要单独一期**：`draw_panel` 这类没有测试、也不能跑起来看的代码，
+  拆分收益是"可读性"，代价是"改坏了看不出来"，所以不跟逻辑重构混在一起做。
+
+## 2026-10-23 配置缓存的有效性用 mtime，而不是等通知
+
+- **背景**：`xime_setup_lib::set_notify_reload_style` 这个钩子在 Windows 侧没有注册，
+  设置程序改完样式不会给 server 发任何报文。以前"改完立刻生效"其实是因为
+  `XimeConfig::load()` 每次按键都从磁盘重读一遍。直接加缓存会把热更新变成"改完要重启"。
+- **做法**：缓存条目带上用户配置的 mtime，`get()` 先 `metadata()` 比一下，变了才重解析。
+  设置程序所有保存都走 `XimeConfig::save()` → 原子写 `user_config_path()`，mtime 必变，
+  所以这条判断覆盖了真实的变更路径；`ReloadConfig` 另调 `invalidate()` 兜底。
+- **不接钩子的理由**：为一个空钩子在两仓三处加协议命令，收益远小于"多 stat 一次文件"。
+
+## 2026-10-23 引擎锁：只挪不碰引擎的重活，维护线程留在锁内
+
+- `ReloadPlugins`（扫插件目录 + 起停剪贴板线程）移到拿锁之前，纯收益。
+- `SyncUserData`（`sync_user_data` + `join_maintenance_thread`）和 `ReloadConfig`
+  （`eng.redeploy()`）**必须**持锁：librime 的维护线程是全局的，正改引擎状态，
+  挪出去就是和键事件并发操作同一个引擎。宁可接受"显式同步期间丢键"。
+
+## 2026-10-23 IPC 超时后必须丢弃连接，不能复用
+
+- 协议是「NUL 结尾的 JSON，一问一答」，**没有请求 id**。读超时之后，对端可能还是会把
+  那条响应写回管道；如果继续用同一条连接，下一条请求就会把这条迟到的响应当成自己的，
+  结果是候选词/提交文本串位——而且完全不报错，比断连难查得多。
+- 所以 `IpcClient` 一旦出错就把底层管道丢掉（`Option`），`is_usable()` 随之变 false；
+  上层（TSF）看到不可用就重连 + 重建 session。重连成本（~1ms + StartSession）远低于
+  一次静默错位的代价。
+
+## 2026-10-23 TSF 编辑会话内不做任何 IPC
+
+- `TF_ES_READWRITE` 的编辑会话期间，文档写锁在输入法手里。在里面同步等另一个进程
+  （管道、甚至最坏 1 秒）会把宿主（Office / 浏览器 / 记事本）一起拖住，观感就是输入法卡死。
+- 规则：**会话内只做 TSF 调用**（取坐标、SetText、SetSelection），凡是跨进程的一律
+  记下来、会话结束后再发。`start_composition` 的插入点上报已按此改造
+  （`XimeEditSession.position` + `send_pending_position`）。
+
+## 2026-10-23 CUDA 运行库的探测留在 server，安装器只负责说明
+
+- GPU 包（`msi-build.ps1 -Gpu`）不打包 CUDA 运行库（约 1GB），目标机可能没装。
+  探测必须按 exe 目录 → System32 → **PATH** 的顺序找 `cublas64_13.dll` /
+  `cublasLt64_13.dll` / `cudnn64_9.dll`（`speech::cuda_runtime_ready()` 就是这么做的）。
+- MSI 侧的 `FileSearch` 只能搜固定目录，探不到 PATH 上的 CUDA `bin`，做出来会给出
+  「没装」的错误结论——比不检测更糟。所以**安装器不做检测**，只把要求写在用户一定
+  会看到的地方（「完成」页的 `CUDA_NOTE` + README 的「GPU 加速包」），
+  真正的判断以 `server.log` 为准。
+- 缺库不是错误：`onnxruntime` 建 CUDA 会话时缺这些 DLL 会直接 abort 进程（C++ 异常
+  穿过 FFI，Rust 兜不住），所以探测是**开会话之前**的硬门禁，缺了就老老实实走 CPU。
+
+## 2026-10-23 用户配置里的数值一律按「无效即回退」处理，不进计算
+
+- `style.candidate_count` 是裸 `i32`，`0` / 负数都能写进 `xime.yaml`。原来
+  `CandidateModel` 直接 `as u32` 交给排版，`items_len / cand_per_row` 除零得到 `inf`，
+  一路变成窗口高度的 `inf`。
+- 规则：用户可写的配置值在**进入计算前**夹到合理区间（`clamp(1, 32)`），
+  纯计算函数自己也不能假设输入合法（`row_count` 内部仍按「至少 1 列」兜底）。
+  两层都要，因为调用方以后还会增加。
+
+## 2026-10-23 引擎锁的边界：不碰引擎的命令一律在拿锁前处理
+
+- `process_request` 是「`try_lock` 失败就回 `fail`」的模型：锁被占时不排队、直接失败。
+  这对打字是对的（宁可丢一个键，也不让宿主 UI 线程等），但副作用是**任何不小心排在
+  锁后面的命令都会在锁忙时静默失效**。已经踩过的两例：托盘「退出」
+  （`ShutdownServer` 只做 `PostThreadMessageW`）和系统通知（`ShowToast`）。
+- 规则：**凡是不读不写 rime 引擎的命令，都放在 `process_request` 开头的预分发里**，
+  锁内分支保留同实现只为 match 穷尽。目前预分发集合：词典文件命令
+  （`ListSchemaEntries` / 自定义短语）、`ReloadPlugins`、语音命令、
+  `ShutdownServer`、`ShowToast`。
+- 推论：**锁内不做 IO**。托盘「方案开关」菜单原来在锁里读 + 解析
+  `<id>.schema.yaml`，菜单开着的时候键事件全被丢；现在第一段锁只取 schema_id，
+  解析在锁外，第二段锁只读几个 option。
+
+## 2026-10-23 单向 IPC 命令是「两端的约定」，不是客户端的习惯
+
+- 协议是「NUL 结尾 JSON、一问一答」，请求与应答靠**顺序**配对、没有请求 id。
+  所以「不看回包」不能只在客户端做：服务端也必须**不写**，否则那条应答会留在管道里，
+  被下一条请求读成自己的应答——候选词/上屏文本串位，且完全不报错。
+- 登记方式只有一处：`IpcCommand::is_one_way()`。服务端 `handle_connection` 依它跳过
+  写回包；客户端只能通过 `IpcClient::send_no_reply()` 发这类命令（内部
+  `debug_assert` 校验，防止误用）。
+- 与此相对，`send_oneway()` 是「写 + 把回包读掉丢弃」，用于 `FocusIn` / `EndSession`
+  这类只关心成没成的命令。名字不准确但保留（改名字要动 7 个调用点，收益不值），
+  文档里写清区别。
+- 新增单向命令的检查清单：① `is_one_way()` 登记；② 服务端确认不回包；③ 客户端改用
+  `send_no_reply`；④ 更新 `only_position_update_is_one_way` 单测。
+
+## 2026-10-23 用户配置只写差异，且绝不覆盖用户的其它内容
+
+- `xime.custom.yaml` 是**用户覆盖层**（文档：`xime.yaml` 随升级覆盖，自定义只写 custom）。
+  因此保存必须满足三条：
+  1. **只写差异**：以「内置 + 系统级」为基线做树级 diff，改回默认就把键删掉；
+  2. **保留未知键**：只摘掉我们结构体认识的顶层键，其余（`keyboard:`、`metadata:`…）
+     原样保留——按结构体整份序列化会静默吃掉这些段；
+  3. **可逆**：每次写前留 `.bak`；第一次改写「用户自己写的文件」前留 `.orig`。
+- 加载侧配套：三层按 **YAML 树**深合并（内置 → 系统 → 用户）。不能按结构体字段替换，
+  否则用户只写 `style.font_size` 会把 `style` 的其它字段打回硬编码默认，
+  系统级配置也会被用户的局部覆盖连坐。
+- 判断「文件是不是程序生成的」只看文件头标记 `# xime-user-config`：没有标记 =
+  用户自己放的（例如方案包里带的），必须留 `.orig` 才能「恢复为用户提供的版本」。
+- 已知取舍：YAML 树合并**不保留注释**（用户文件里的注释会在程序保存时丢失）。
+  这是"结构化读写"的固有代价；需要保留注释就只能放弃程序内保存。
+
+## 2026-10-23 `style.candidate_count` 是「显示数量」，必须同步 rime 的 page_size
+
+- 候选来自 librime 的**一页**（`menu/page_size`）。`candidate_count` 只是"最多显示几个"，
+  所以它永远受 page_size 压制：想显示 7 个，page_size 必须 ≥ 7，否则候选栏永远只有 5 个，
+  用户看到的就是"设置不生效"。
+- 因此把 `style.candidate_count` 视为**派生源**：服务端在部署前把
+  `patch.menu.page_size` 写进 `default.custom.yaml`（只改这一个键、保留其它 patch），
+  再由 `ui/model.rs` 按 `candidate_count` 截断显示。两层都要，缺一不可
+  （page_size 不够 → 拉不到；显示不截断 → 超出用户设置）。
+- 这类"设置项在 UI 里有、渲染端没读"的问题，排查顺序固定：先 grep 使用点，
+  再确认默认值来源。`corner_radius` 就是典型：UI 一直写，`paint.rs` 一直写死。
+
+## 2026-10-23 `default.custom.yaml` 是 Xime 固定配置；候选数量只能走默认层
+
+- 契约（与 Android 侧一致）：`default.custom.yaml` 由 Xime 生成/同步，
+  文件头写明"请勿在此手工调整"，部署时 patch 到 `default.yaml`。
+  所以 `menu.page_size` 这类全局候选参数写这里，**不要**给每个方案生成
+  `<schema>.custom.yaml`（会在用户 rime 目录里堆出一堆机器生成文件，卸载时也说不清归属）。
+- 代价与约束：`menu/page_size` 是**方案级**配置，方案包里写死的值会压过默认层。
+  约定是"方案不要写 page_size，交给 xime 管"；真遇到写死的，服务端在部署后
+  用 `warn!` 点名，而不是悄悄去改别人的方案文件。
+- 选字键上限 10（1–9 + 0）：`CandidateModel.selkeys` 固定 10 个，
+  显示数量、`page_size`、设置页滑杆三处上限对齐，避免出现"显示了但没有键可选"。
+
+## 2026-10-23 用户可见的通知必须有统一入口、去重与限流
+
+- 系统通知是**用户可见的副作用**，不能像日志那样随手调：
+  同一件事常被多条路径触发（设置页 + 服务端），重活时又会一次刷好几条。
+  如果不去重，用户会以为出了很多次错。
+- 规则：同一内容 10 秒内只弹一次；10 秒内最多 3 条；被挡掉的都留日志
+  （去重 `debug`、限流 `warn`）。真正弹出时 `info` 记一条，便于对日志。
+- 实现：`winxime-server/src/notify.rs` 是唯一入口，`toast::show_toast` 只允许它调用；
+  `Throttle` 用注入的 `Instant` 判定，所以规则本身可单测（不依赖系统通知能力和时间流逝）。
+- 通知文案面向普通用户：说"发生了什么 + 下一步"，不写内部术语、不带错误码；
+  详细的失败原因留在 `server.log`。
+
+## 2026-10-23 librime 插件只能落在 `librime/plugins/`（用联接，不改源码）
+
+- 上游没有"树外插件"通道：`file(GLOB plugins/*)` + `add_subdirectory` +
+  `PARENT_SCOPE` 变量合并，决定了插件必须是 librime 的子目录。官方
+  `action-install-plugins-windows.bat` 也是 `git clone ... plugins\<name>`。
+- 「librime 目录只读」约束的是**源码/历史**：`librime/build`、`librime/dist` 一直是
+  构建产物所在地。插件同理属于构建输入，所以用**目录联接**指向仓库外的 clone，
+  源码不进 librime，`git status` 保持干净，删联接即可回退。
+- 因此 `rebuild.ps1` / `msi-build.ps1` 增加了插件在位检查：缺插件不会编译失败，
+  但会**静默**产出没有 lua 的 `rime.dll`，必须提前提示。

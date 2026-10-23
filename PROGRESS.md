@@ -2216,3 +2216,717 @@ server IPC（设置进程不碰 librime、不猜 rime 目录）；UI 侧沿用 P
   ~~P3 设置 UI（模型下载/切换/删除/试听 + provider 显示 + IPC 贯通）~~ ✅ →
   ~~P4 CUDA 加速包（构建脚本 + MSI 文件清单 + 运行库分发决策）~~ ✅ →
   P5 收尾（下载源健壮性 + 安装器 CUDA 提示 + 排版复核）。
+
+### 2026-10-23 技术债清理（第一期：旧方案市场死代码 / 基线失败测试 / 生产 unwrap·expect）
+
+- **本机首次跑通全链路构建**（此前仓库只在作者机器上验证过）：
+  - 环境：VS 2022 BuildTools 17.14 + MSVC 14.44 + CMake 3.31 + Windows SDK + Boost 1.89 头；
+    `libximecore/librime` 源码构建出 `dist/lib/rime.dll`（deps 先 `build.bat deps`，再 `librime shared`）。
+  - `librime` 的 deps 子模块用 `git submodule update --init`；OpenCC / yaml-cpp 的 GitHub 全量 clone
+    在本机不通，改用 codeload 上对应 commit 的 tarball 解压（不影响构建，只是工作区里的子模块没有 git 元数据）。
+  - `.cargo/config.toml`（gitignored）补 `LIBCLANG_PATH`（bindgen 用）；`libquickjs-ng-sys` 默认写死 clang，
+    本机用 `TARGET_CC=cl.exe` + `CFLAGS=/std:c11` 走 MSVC（quickjs-ng 需要 C11 原子）。
+    若装了 LLVM/clang 则不需要这两个变量。
+  - **上游 libximecore HEAD（f1c8326）有 Windows 回归**：`crates/xime-setup/src/pages/mod.rs` 给
+    `pub mod voice;` 加了 `#[cfg(target_os = "linux")]`，而调用点只按 `voice-page` feature 门控 →
+    Windows 打开该 feature 必然编译失败。本机在本地克隆里去掉那一行绕开（未提交，属上游问题）。
+- [x] **删掉旧方案市场 IPC 死代码**（与 `xime_config::schema_manifest` 功能重复，且旧实现写同名
+  `.registry.yaml` 但格式冲突——旧代码是 `packages:` 映射，新格式是扁平 `包id -> {files, sha256}`，
+  两套代码同时存在属潜在数据损坏）：
+  - `winxime-server/src/schema_manager.rs` 整文件删除（292 行）。
+  - `winxime-ipc`：删 6 个 `IpcCommand`（FetchSchemaIndex / DownloadSchema / InstallSchema /
+    UninstallSchema / ListMarketSchemas / ListInstalledPackages）、3 个 `IpcRequestData`、
+    3 个 Request 结构、`SchemaMarketResponse` 枚举、`IpcResponse.market_response`。
+  - `ipc_server.rs`：删 6 个命令分支 + 66 处 `market_response` 字段 + `schema_mgr` 参数链；
+    `main.rs`：删 `mod schema_manager`、`market/` 目录创建与 `SchemaManager` 实例。
+  - 设置程序与 resources 里无任何调用点（全仓 grep 只剩历史文档），删除后 server 也不再创建 `market/`。
+- [x] **修 3 个基线失败测试**：`plugins.rs` 的 `temp_root()` 从 `%TEMP%` 改到仓库 `target/test-tmp/`
+  （与 2026-10-02 新测试同一约定；受限宿主 `%TEMP%` 不可写就是这批失败的真因）。
+  `clipboard_selection_follows_clipboard_sync_toml` / `clipboard_worker_records_history_without_sync_plugin` /
+  `backup_now_uses_typed_plugin_runtime` 全部转绿。
+  - 同类隐患一并清掉：`models.rs` / `schema_switches.rs` 里那 4 个基线失败测试、以及 speech 的三个
+    测试夹具，目录统一改到 **workspace** `target/test-tmp/`（`CARGO_MANIFEST_DIR/../..`）——
+    原来的写法落在 `crates/winxime-server/target/`（不在 `.gitignore` 的 `/target` 覆盖范围，
+    跑一次测试就留一个未跟踪目录）。
+- [x] **生产代码 `unwrap()/expect()` 清零**：
+  - `winxime-tsf-register`：新增 `arg_at()` 统一取参（缺参 → 打印提示 + 退出码 1）；`current_exe()/parent()`
+    改显式错误分支；`GetProcAddress(...).unwrap()` → `let Some(proc) = ... else`（2 处）。
+  - `winxime-tsf/src/dll.rs`：`log_path.parent().unwrap()` → `if let Some(parent)`。
+  - `winxime-setup/src/main.rs`：`hwnd.unwrap()` → `if let Ok(hwnd)`。
+  - `winxime-setup/build.rs`：`res.compile().expect(...)` → 失败时 `cargo:warning` + `exit(1)`（构建期仍然失败，只是不再 panic）。
+  - `winxime-server`：IPC 安全描述符 `expect` → 失败记日志并返回；`main.rs` debug 路径 `parent().unwrap().parent().unwrap()`
+    → `ancestors().nth(2)`。
+  - 余下的 `unwrap/expect` 全部在 `#[cfg(test)]` 模块内（models / schema_switches / speech / ui / ipc_server 单测）。
+- [x] **顺手修**：`winxime-tsf-register/Cargo.toml` 补 `Win32_System_Registry` feature —— 此前单 crate
+  `cargo check -p winxime-tsf-register` 会失败，只有全 workspace 构建靠 feature 合并才碰巧通过。
+- 验证：`cargo check --quiet` = 0；`cargo build --quiet` = 0；`cargo test -p winxime-server` =
+  **102 passed / 0 failed / 1 ignored**（原基线 92 passed / 7 failed）；`cargo test --workspace` 同结果。
+### 2026-10-23 技术债清理（第二期：警告清零 / clippy 清零 / 测试夹具去重）
+
+- **构建环境再省一步**：装 LLVM 23.1.4 后，`libquickjs-ng-sys` 不再需要
+  `TARGET_CC=cl.exe` + `CFLAGS=/std:c11`（`cargo clean -p libquickjs-ng-sys` 后干净重建通过）；
+  `LIBCLANG_PATH` 从 pip 的 libclang 改指 `C:/Program Files/LLVM/bin`。
+  另给 `nightly-2026-07-03` 补装了 `clippy` 组件，仓库第一次能跑 clippy。
+- [x] **rustc 警告 21 → 0；`cargo clippy --workspace --all-targets` 83 → 0**（含 1 条 deny 级错误）。
+- [x] **死代码处理（先分类，不盲删）**：
+  - 云备份簇（`build_backup_archive` / `backup_now` / `list_backups` / `restore_backup` /
+    `delete_backup` + 3 个打包/日期 helper）实现完整且有单测，但**没有 IPC 命令和设置页入口**。
+    按"不删、留待接线"处理：整簇搬进独立的 `#[allow(dead_code)] impl PluginHost`，
+    3 个自由函数改为关联函数，doc 写明"接线后删掉 allow"。
+  - `has_typed_plugin()` 删掉（真无人调用）；`has_clipboard_sync()` 只在单测用 → `#[cfg(test)]`。
+  - `context.rs`：删掉**无人消费**的 `dirty` 原子标志 + `with()` + `is_dirty()`（`update/read` 保留）；
+    TSF 数据镜像字段（`cursor_pos`/`sel_start`/`sel_end`、`text`/`comment`、`prefix_text`、
+    `selected_index`/`page_size`）加 `#[allow(dead_code)]` + 注释说明"面板暂未消费"；
+    `SuggestionState` 手写 `Default` → derive；补 `Default for SharedInputContext`。
+  - `ui/model.rs`：`CandidateModel::from` 里重复计算的 `font_family` 改用局部变量；
+    `RootModel.bg_color/fg_color` 原本只写不读（painting 里写死同值 0.98/0.2）→
+    **接进 `on_paint_root` 的画笔**，字段变活、字面量去掉；`total_pages/current_page` 加 allow。
+  - `RenderedMetrics.comment_widths` 整条链路删除（layout 收集、paint 读出来又不用）。
+- [x] **clippy 手改项**（自动 `--fix` 之外）：
+  - `ipc_server.rs` 的恒真断言 `assert!(status.models_rev >= 0)`（u64 永远成立）→
+    改成与 `speech::download::models_rev()` 比对；`plugins.rs` 两处 `assert!(false, …)` → `panic!`。
+  - `glyph.rs` 的 `assert!(MAX_COUNT <= PER_PAGE)`（两个常量）→ `const _: () = assert!(…)` 编译期断言。
+  - `TF_SELECTION` 两处"先 default 再逐字段赋值" → 结构体字面量（含 `TF_SELECTIONSTYLE`）。
+  - `GetProcAddress` 的 `transmute::<_, …>` → 先取 `FARPROC` 再 `transmute` 成具体签名（不再靠类型推断）。
+  - `loop { match rx.recv() { Ok => …, Err => break } }` → `while let Ok(…)`；`TrayIcon::new()` → `install()`。
+  - `tray.rs` 六处 `NOTIFYICONDATAW` 重复初始化（cbSize/hWnd/uID + szTip 拷贝循环）→
+    `tray_nid()` / `set_tip()` 两个 helper。
+  - 保留 2 处 `#[allow(clippy::too_many_arguments)]`（`draw_panel` 10 参、`on_paint_with_metrics` 8 参）
+    和 1 处 `#[allow(clippy::arc_with_non_send_sync)]`（TSF 对象套间线程绑定，注释说明理由），
+    都指向技术债 D/E 项。
+- [x] **测试夹具去重**：新增 `crates/winxime-server/src/test_support.rs`（`#[cfg(test)] mod`），
+  6 个文件里各写一版的 `temp_root()/temp_dir()` 收敛成一行委派。顺带对齐三处漂移：
+  统一带 pid 后缀（原 speech 两份没有，并行跑会撞目录）、统一预建 `rime/` 子目录、
+  去掉 `create_dir_all(...).unwrap_or_default()`（静默吞错）；`plugins.rs` 最后一处
+  `std::env::temp_dir()` 也改到 `target/test-tmp/`。
+- **验证**：`cargo build --quiet` = 0 行输出；`cargo clippy --workspace --all-targets` = 0 warning；
+  `cargo test --workspace` = **102 passed / 0 failed / 1 ignored**（与第一期结果一致）；
+  生产代码 `unwrap()/expect()` 仍为 0。
+- [ ] **第二期未做（已登记，留给 D/E）**：
+  - D 巨函数：`ipc_server::process_request` 1094 行（42 个命令分支）、`panel::draw_panel` 904 行、
+    `view::RenderedView::new` 723 行。
+  - E TSF 日志：`winxime-tsf/src/dll.rs` 仍用 `eprintln!`（15 处）写 stderr，TSF 宿主里看不到，
+    且在 `DllMain` 路径上有风险。
+  - 顺带发现（未改）：`ui/paint.rs` 的候选绘制循环里每帧打 5 条 `info!`（`item {}: x=…`
+    这类调试输出），多候选时是纯噪音 + 每帧格式化开销。
+
+### 2026-10-23 技术债第三批：热路径日志 / TSF 日志 / process_request 拆分
+
+- [x] **热路径日志降级**（信息保留，只是默认不格式化、不刷屏）：
+  - `ui/paint.rs`：每帧 2 条帧级 + 3 条逐候选 `info!` → 1 条帧级 `trace!` + 1 条逐候选
+    `trace!`（`bg_rect`/`item_right` 并进后者，少两次格式化）。
+  - `ui/view.rs`：`WM_UPDATE_CANDIDATE` 的 DPI/metrics 4 条、`WM_PAINT` 的 2 条、
+    `update complete` → `trace!`，其中 metrics 三条合并成一行。
+  - `ui/mod.rs`：`show()`/`update()` 每次都走，6 条 `info!` → `trace!`；
+    Direct2D 初始化失败 `info!` → `error!`（原来初始化失败只报 info）；
+    视图未初始化 / `PostMessageW` 失败 → `warn!`。
+  - 结果：默认（info）级别下，候选栏每次按键 0 条日志；`RUST_LOG=trace` 全都能看到。
+- [x] **E：TSF DLL 日志**
+  - 删掉 `DllMain` 里那段 `%TEMP%\winxime\tsf.log` 目录创建：`init_logging("tsf")`
+    写的是数据目录（`%APPDATA%\...\logs\tsf.log`），这个 TEMP 目录建了没人用。
+  - 而且 `DllMain` 在**加载器锁**里，建目录 + `tracing_appender` 起后台写线程都有死锁风险。
+    改为 `init_logging_once()`（`Once`），放在 `DllGetClassObject` / `DllRegisterServer` /
+    `DllUnregisterServer` 三个真正入口。
+  - `do_register` 的 15 条 `eprintln!`（regsvr32 场景没有控制台，写了也没人看得见）→
+    `info!/error!`，进同一份 `tsf.log`；注册失败原因现在可查。regsvr32 的失败提示行为不变。
+- [x] **D：`ipc_server::process_request` 拆分（1094 → 453 行）**
+  - `IpcResponse` 增加 `ok(session_id)` / `fail(session_id)` 骨架构造器
+    （`winxime-ipc/src/messages.rs`）：60 处 8 字段字面量收敛为骨架 + 差量字段，
+    `context: None` 一类噪音消失，`ipc_server.rs` 净减约 330 行。
+  - `ProcessKeyEvent`（192 行）→ `handle_key_event(request, eng, context, window, ascii_mode)`；
+    词典 7 个分支（ListUserDicts/ListDictEntries/ImportDictEntry/BackupUserDict/
+    RestoreUserDict/ExportUserDict/ImportUserDict）→ `handle_dict_command(...)`。
+    均为**纯搬移**，逻辑未改。
+  - 搬移由脚本完成，脚本自带自检：把所有被替换区间从改前/改后文本里挖掉后，
+    两侧代码必须逐字相同（防止手工复制漏行/多吃一行）。
+- [x] **D 的重新测量**：`view::RenderedView::new` 实际 **119 行**——之前记的 723 行是
+  `impl RenderedView` 整块的统计口径（含 `wnd_proc`、`create_swapchain_bitmap` 等），
+  不需要拆。
+- [ ] **D 剩余：`panel::draw_panel` 901 行未拆**（评估结果与方案）
+  - 构成：约 300 行画笔/文本格式准备 + `match page` 三个分支（菜单 155 行 /
+    剪贴板·快捷发送 284 行 / 语音 153 行）。三个分支依赖准备区 14~21 个局部名字
+    （画笔、文本 format、面板几何）。
+  - 方案：`struct PanelGfx`（画笔 + format + `d2d`）+ `build_panel_gfx()`；三个分支拆成
+    `draw_menu_page` / `draw_list_page` / `draw_voice_page(&gfx, &geom, ...)`，
+    `draw_panel` 只留几何计算 + 分发。
+  - 暂不做的理由：这是**纯视觉代码，且当前没有可用的验证手段**（规则禁止运行程序，
+    也没有截图基线）。搬移约 600 行时，编译期只能拦住名字/类型错误，坐标、画笔取错
+    这类问题只能靠肉眼。建议单独一期做，并配一张"改前/改后截图对比"的人工验收清单。
+  - **2026-10-23 用户决定：暂不做**，`draw_panel` 保持原样；`too_many_arguments` 的 allow
+    与注释继续保留（注释指向的就是这件事）。真要动时按上面的方案分两步：先搬画笔准备区
+    （零视觉风险），人工截图确认后再拆三个页面分支。
+- **验证**：`cargo build` 0 输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **102 passed / 0 failed / 1 ignored**（与前两期一致）。
+
+### 2026-10-23 技术债第一批：日志重复初始化 / 配置缓存 / 引擎锁收窄
+
+- [x] **TSF 日志不再每次 `Activate` 重建**：`text_input_processor.rs::activate_impl` 原来直接调
+  `xime_config::init_logging("tsf")`，而它内部 `*g = Some(guard)` 会丢掉旧 guard
+  （`WorkerGuard::drop` 最坏约 1.1 秒），且正好发生在输入法激活的宿主 UI 线程上。
+  改为 `crate::dll::init_logging_once()`（`Once`），与 COM 激活 / 注册 / 反注册共用一次初始化。
+- [x] **配置读取加进程级缓存**（`winxime-server/src/config.rs`）：
+  `XimeConfig::load()` 每次要解析内嵌 yaml + 系统/用户两份文件 + 两轮 merge，而候选栏
+  **每次按键**取三次配置（`RootModel`、`CandidateModel`、五笔根字提示 `ShowRoot` 各一次）。
+  改为缓存 `Arc<XimeConfig>`，有效性看**用户配置文件的 mtime**；另提供 `invalidate()`
+  给 `ReloadConfig` 用。
+  为什么不用通知钩子：`xime_setup_lib::set_notify_reload_style` 在 Windows 侧**根本没注册**，
+  等通知的话改完样式得重启才生效。以前"能热更新"纯粹因为每次按键都重读文件。
+  三个调用点（`ui/model.rs` ×2、`ipc_server.rs` 的 `ShowRoot`）+ `main.rs` 启动路径全部改走缓存。
+  单测 `config::tests::config_cache_hits_and_invalidates`：未失效时命中同一份，`invalidate` 后重解析。
+- [x] **引擎锁收窄：`ReloadPlugins` 移到拿锁之前**（`plugin_host.reload()` 只扫插件目录 +
+  起停剪贴板线程，不碰引擎；插件多时目录扫描 + manifest 解析不便宜）。锁内分支保留同一实现
+  （`handle_reload_plugins`）只为让 match 穷尽。
+- [ ] **`SyncUserData` / `ReloadConfig` 仍留在锁内——主动决定，不是漏做**：
+  `librime::sync_user_data()` 之后要 `join_maintenance_thread()`，那是 librime **全局**维护线程，
+  正在改引擎状态。把它挪出锁，键事件就会和维护线程并发操作同一个引擎（`RimeEngine` 的安全性
+  本来就靠这把锁），属于数据竞争。代价是同步期间（秒级）的键事件 `try_lock` 失败被丢弃；
+  这是"用户在设置页显式点同步"的罕见场景，接受。
+  真要消除，得让 TSF 侧把按键排队/重放（且不能占 UI 线程），不是挪锁能解决的。
+- **验证**：`cargo build` 0 输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **103 passed / 0 failed / 1 ignored**（102 + 新增配置缓存用例）。
+
+### 2026-10-23 技术债第二批：IPC 不再无边阻塞 / 编辑会话内零 IPC
+
+- [x] **建连有上限**：`connect_by_path`（等实例没有上限）改成
+  `connect_by_path_with_wait_mode(ConnectWaitMode::Timeout(1s))`；`check_server_running`
+  用 2s（冷路径，给宽一点免得服务端忙一下就误判成没运行）。
+  `WaitNamedPipeW` 在「服务端根本没起」时是**立即**返回 `ERROR_FILE_NOT_FOUND` 的，
+  只有「管道名在、实例都忙」才真等，所以启动流程不会凭空慢 2 秒。
+- [x] **读响应有真超时**：原来写的是「`read` 一个字节 + 前后比 `Instant`」，可 `read`
+  自己不带超时——对端不吭声它就永远阻塞，那个 `Instant` 检查永远轮不到
+  （`READ_TIMEOUT_MS = 100` 从来没生效过）。调用方是 TSF 里的宿主 UI 线程，卡在这里
+  就是整个桌面假死。
+  改为先用 `PeekNamedPipe` 问「到了多少字节」，只读**已经到达**的部分，每次 `read`
+  都是短读；没数据先自旋 2ms（避开 Windows 定时器 1ms~15.6ms 的睡眠粒度，否则每次
+  按键都被硬加十几毫秒），再 1ms 睡到期限。
+  顺带把「逐字节 read」改成「按可用字节整块 read」：一条候选栏响应原来要几百上千次
+  系统调用。
+- [x] **超时/出错后连接立即作废**：协议里没有请求 id，迟到的响应会被下一条请求当成
+  自己的（候选词串到别的按键上，且**静默**）。所以 `IpcClient` 内部把管道改成
+  `Option`，任何一次错误就丢掉；新增 `is_usable()`，TSF 的 `is_connected()` 据此返回
+  false，下一键直接重连，不白丢一个键。
+- [x] **时限分档**：快命令（按键、状态查询、toast）1s；慢命令（词典导入导出、方案词表、
+  快捷短语、用户资料同步、redeploy、重载插件）60s——沿用「慢而正确不能误判成超时」的
+  既有约束，只是从「永不超时」变成「上限 60s」。
+- [x] **编辑会话里不再发 IPC**：`start_composition` 在 `TF_ES_READWRITE` 会话里同步调
+  `ipc.update_position`，等于拿着文档写锁等另一个进程（最坏 1s），Office / 浏览器会跟着卡。
+  改为 `caret_position_in_session()` 只在会话内量坐标（`GetTextExt` 需要有效的 `ec`），
+  坐标存进 `XimeEditSession.position`，会话结束后由 `send_pending_position()` 发出去。
+  会话被 TSF 排到异步执行时取不到坐标，下一位按键的 `update_caret_position_sync`
+  会补一个更新的位置，不会错位。
+- **没加单测的原因**：管道测试要用固定名字（`messages::get_pipe_path()`），会和真实
+  服务端/并行测试抢同一个管道名，收益不抵风险；这部分靠编译 + 协议语义推演。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **103 passed / 0 failed / 1 ignored**。
+
+### 2026-10-23 技术债第三批：安装器 CUDA 提示 / 候选栏列数除零
+
+- [x] **P5 ② 安装器 + 文档的 CUDA 提示**（检测本身早就在 server 里，缺的只是「让用户看见」）：
+  - `wix/main.wxs` 加 `CUDA_NOTE` 属性：`-Gpu` 包是运行库要求原文，CPU 包是一个空格。
+    不用空串是因为「空值属性在格式化文本里能否展开」没有把握，万一不展开，「完成」页
+    会露出字面的 `[CUDA_NOTE]`；空格最坏只是多一个空格。
+  - `wix/zh-cn.wxl` 的 `ExitDialogDescription` 末尾加 `[CUDA_NOTE]`——安装向导的「完成」
+    页是每个安装用户都会看的一屏。**没往 feature 描述里写**：本项目用
+    `WixUI_InstallDir`，界面上根本没有 feature 树，写了也看不见。
+  - `README.md` 新增「GPU 加速包（可选）」：CPU 包 / GPU 包对照表、目标机要求
+    （CUDA 13 运行库 cuBLAS + cuDNN 9）、**怎么确认生效**（`server.log` 里的
+    `语音识别使用 CUDA（GPU）` / `未找到 CUDA 运行库（cuBLAS）`）、两个包为什么不能混装。
+  - `msi-build.ps1 -Gpu` 构建成功后再打两行目标机要求。
+  - **为什么不在 MSI 里做检测**：`cuda_runtime_ready()` 是按 exe 目录 → System32 → PATH
+    查 `cublas64_13.dll` 的，而 CUDA 运行库通常装在 Toolkit 的 `bin` 里、靠 PATH 才能找到，
+    MSI 的 `FileSearch` 探不到 PATH，硬做会得出「没装」的错误结论。所以检测留在 server，
+    安装器只负责把要求说清楚。
+  - **待真机确认（我做不了）**：`-Gpu` 包实装后「完成」页那行提示的位置/换行是否好看；
+    CPU 包「完成」页不应出现任何多余字符。
+- [x] **P5 ③ 可自动验证的那部分：候选栏列数为 0 的除零**：「4K/窄窗口排版复核」本身要眼睛看，
+  但顺手查出个真 bug：`style.candidate_count` 是用户可写的裸 `i32`（`0` / 负数都能存进
+  `xime.yaml`），`CandidateModel` 直接 `as u32` 用它，`layout` 里 `items_len / cand_per_row`
+  就成了除零 → `inf` → `bar_height` / `hw_height` 全是 `inf` → `SetWindowPos` 收到无穷大。
+  - `ui/model.rs`：源头夹住 `clamp(1, 32)`（`paint.rs` 用同一个值做换列判断，一起治好）。
+  - `ui/layout.rs`：抽纯函数 `row_count(items, cand_per_row)`，内部按「至少 1 列」算，
+    调用方不必各自防；3 个单测（0 列不出 `inf`、常规分页、`usize::MAX` 极端值仍有限）。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **106 passed / 0 failed / 1 ignored**。
+- **仍待人工**：P5 ③ 的观感复核（4K / 窄窗口）与 P5 ④ 真机全链路（下载模型 → 切换 →
+  试听 → 面板 🎙️ 上屏）——助手禁止运行程序/安装，只能由用户目视验收后再回报。
+
+### 2026-10-23 技术债第四批：引擎锁忙时「退出」失效 / 托盘菜单持锁解析
+
+- **症状（审计 P1 里最讨人厌的一条）**：`process_request` 是「先 `try_lock` 再 match」，
+  拿不到锁就统一回 `fail`。于是引擎正忙（同步用户资料、`redeploy`、部署）时，
+  托盘点「退出」→ `ShutdownServer` 也回 fail → **退出彻底没反应**，用户只能去任务
+  管理器杀进程。`ShowToast` 同样白排在锁后面（它连引擎都不读），锁忙时弹不出通知。
+- [x] **预分发再收两条**：`ShutdownServer` / `ShowToast` 挪到 `process_request` 开头的
+  锁外分块，与 `ReloadPlugins` / 语音命令同一套路。实现抽成 `handle_shutdown`
+  与 `handle_show_toast`，锁内分支保留同实现只为 match 穷尽（照 `handle_reload_plugins`
+  的写法，避免两处行为漂移）。
+- [x] **托盘「方案开关」菜单不再持锁读盘**：`SwitchProvider` 原来在一把锁里做
+  `get_current_schema` + `read_schema_switches`（整份 `<id>.schema.yaml` 的 read +
+  `serde_yaml` 解析）+ 逐项 `get_option`。菜单弹出期间所有键事件 `try_lock` 都失败
+  → 键被丢，观感就是「右键托盘，输入法卡住」。
+  改成两段：第一段拿锁只取 `schema_id` 就放开；文件解析在锁外；第二段再拿锁读各开关
+  当前值（只有几次 `get_option`，不碰 IO）。两次拿锁之间切换了方案也不影响正确性
+  ——点菜单是按开关名设值，菜单本身是瞬时的。
+- **没加单测的原因**：这两条都要真的持有 `Arc<Mutex<RimeEngine>>` 才能复现（引擎初始化
+  依赖 librime + 部署产物），单测成本远高于收益；靠「预分发在锁之前」这一处结构保证。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **106 passed / 0 failed / 1 ignored**。
+- [x] **用户实测通过（2026-10-23）**：① 打字同时点托盘「退出」正常退出（以前没反应）；
+  ② 右键托盘弹菜单期间继续打字，按键不丢；③ 重活期间通知照常弹出。
+- [x] **顺带修了构建环境的一个坑**（与本批改动无关，是用户跑 `.\rebuild.ps1` 撞到的）：
+  `libquickjs-ng-sys` 的 `build.rs` 硬编码 `cc::Build::compiler("clang")`，而 `PATH` 里
+  没有 LLVM 的 `bin`（`.cargo/config.toml` 的 `LIBCLANG_PATH` 只给 bindgen 找
+  `libclang.dll`，`cc` 找编译器走 `PATH`）→ release 构建在 quickjs 那步报
+  `failed to find tool "clang"`。`rebuild.ps1` / `msi-build.ps1` 现在开场自己补
+  `PATH`：优先 `$env:LIBCLANG_PATH`，否则 `C:\Program Files\LLVM\bin`；都没有才黄字警告
+  （不吞错，让 cargo 自己报）。
+- **仍未覆盖**：`rustfmt` 组件没装（bindgen 的 `Failed to run rustfmt ... non-fatal`
+  警告）——不影响产物，只是 bindings 没格式化。
+
+### 2026-10-23 技术债第五批：位置上报改真单向（每键少一次 IPC 往返）
+
+- **原来的样子**：`send_oneway` 名字是单向，实现是「写完再把回包读掉」
+  （`read_response(QUICK_TIMEOUT)`）。`update_position` 每次按键发一条，于是
+  **一次按键 = position 一次完整往返 + ProcessKeyEvent 一次**。
+- [x] **加一条显式的协议契约**：`IpcCommand::is_one_way()`（目前只有
+  `UpdateInputPosition`）+ `IpcClient::send_no_reply()`（写完就走，不读）。
+  `send_oneway()` **保留原语义**（写 + 把回包读掉丢弃），并补文档说明它为什么必须读
+  ——`FocusIn`/`EndSession`/`ToggleAsciiMode` 等 7 处在用它，服务端对它们照常回包。
+- [x] **服务端配合**：`handle_connection` 对 `is_one_way()` 的请求处理完**不写回包**。
+  协议没有请求 id，多写一条就会留在管道里被下一条请求读成自己的应答（静默串位）。
+- [x] **顺带把位置上报挪出引擎锁**（`handle_update_position`）：它只写
+  `SharedInputContext`，不碰 rime。以前引擎忙（同步资料 / 部署）时 `try_lock` 失败，
+  坐标更新被当成失败丢掉 → 候选栏停在旧位置；现在锁外预分发，坐标不丢。
+- [x] **热路径日志再降两条**：`Received request: {:?}`、`Position: {},{}` 从 `info!`
+  改 `trace!`（每键各一行，历史 21MB 日志里这类行占大头）。
+- **单测**：`messages::tests::only_position_update_is_one_way`——守**反向约束**：
+  会回包的命令不能被登记成单向（两个方向都是静默错位，编译期看不出来）。
+- **收益**：每键少一次往返（写 + FlushFileBuffers + 等 + 读）；引擎忙时坐标也不再丢。
+- **已知边界（如实记录）**：新旧二进制交叉运行（旧 server + 新 TSF）时，旧 server 会
+  回包而新客户端不读 → 下一条请求读错。本项目 TSF 与 server 同包发布、一起重建，
+  接受这个边界；单独替换 server.exe 时要注意。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **107 passed / 0 failed / 1 ignored**；顺带跑了
+  `cargo doc --no-deps --workspace` 把 3 条 rustdoc 断链清掉（`IpcClient::pipe`、
+  `SLOW_TIMEOUT`、`download::catalog` —— 都是指向私有项/未解析的旧链接，
+  改成普通代码段，不新增公开 API）。
+- **待真机验证**：正常打字候选栏跟随光标；面板/悬浮窗定位不偏移（尤其 Office 里
+  换行、点选后立刻打字）。
+
+### 2026-10-23 排障：换用 moqi 双拼方案包后的 5 个问题（含 1 个已修）
+
+**用户报告**：清空 `%APPDATA%\xime\rime` 后放入 `rime-shuangpin-fuzhuma-Lite_moqi`，
+设置里选 `moqi_wan_flypymo` → 部署 → 只有英文字母且卡顿；重开设置又显示 emoji；
+改外观后 `xime.custom.yaml` 被「覆盖」；商店网络错误；词典页「读取词条失败」。
+
+- [x] **词典页「读取词条失败（输入法服务未运行？）」——已修**。
+  `server.log` 里的真实原因是 `导出词库失败…ExportUserDict`：`ListDictEntries` 在会话
+  持有 user dict 时直接 `export_user_dict`，而 librime 要求 Export 前 user dict 处于
+  **关闭**状态（`ImportDictEntry` 早就按这条走 `with_user_dict_closed`，读路径漏了）。
+  改为同样走 `eng.with_user_dict_closed(...)`（关会话 → 导出 → 重建会话）。
+  设置页那句「输入法服务未运行？」是**猜测文案**，与服务状态无关——服务一直活着。
+- **已核实：`rime.dll` 没有 lua**。在 `target\msix-pkg\rime.dll` 与
+  `libximecore\librime\dist\lib\rime.dll` 里搜不到 `lua_filter` / `lua_translator` /
+  `lua_processor` / `LuaComponent` 任何一个符号（librime 的 `plugins/` 只有插件加载器，
+  lua 要单独挂 `librime-lua`；构建时 `ENABLE_EXTERNAL_PLUGINS=OFF`）。
+  而 `moqi_wan_flypymo` 的引擎里有 **10 个 lua 组件**（3 个 filter、1 个 processor、
+  6 个 translator），所以这套方案在曦码里注定功能不全。要修得给 librime 构建挂
+  `RIME_PLUGINS=librime-lua` 并重编 rime.dll（上游构建链改动，未做）。
+- **「只有英文字母 + 卡顿」：按键根本没到 server**。服务器日志 18 分钟内只有 **1 条**
+  按键事件（还是粘贴触发键）。TSF 侧 `process_key_event` 在 `ascii_mode=true` 时直接
+  `return false`（不询问 rime、不写日志），另有一条「TIP 没被当成当前键盘」的路径。
+  TSF 日志在同一时段显示 `XimeTextService::new()/Activate` 每 ~5 秒一次——更像被反复
+  激活/卸载，而不是正常打字。**结论：需要补可诊断日志后再复现，不猜。**
+- **「设置里当前方案回到 emoji」：引擎侧数据看是 moqi**。`user.yaml` 的
+  `previously_selected_schema` 是 `moqi_wan_flypymo`，`build/default.yaml` 的
+  `schema_list` 第一条也是 moqi，日志里三次 `schema selected successfully`。
+  所以要么设置页取错了值，要么之后某次 deploy 换了方案。**待日志**：选完之后打印
+  引擎实际报的 schema，一眼就能分辨。
+- **`xime.custom.yaml` 不是编码损坏**：文件是合法 UTF-8（`wubi_radicals` 里的汉字完整）。
+  真实问题是 `XimeConfig::save()` 把**合并后的整份配置**写回用户文件（含 5KB 的
+  `wubi_radicals`、全部内置配色、`pair_secret`）——外观页点一下 = 整份默认配置落盘，
+  用户在文件里手写的键/注释都会被覆盖。修法是「只写用户差异」，属上游 `xime-config`。
+- **商店「网络错误」**：`https://index.ximei.me/{rimes,plugins/v2,models}/index.yaml`
+  在带代理与直连两种方式下都返回 200，不是域名/代理不通；而 `setup.log` 里**没有任何**
+  网络错误记录（错误被吞了，正好印证日志缺口）。需要页面上的原始文案才能继续。
+- **验证**（本次代码改动只有词典读路径）：`cargo build --quiet` 无输出；
+  `cargo clippy --workspace --all-targets` 0 warning；`cargo test --workspace`
+  = **107 passed / 0 failed / 1 ignored**。
+
+### 2026-10-23 可诊断日志（B 批）：方案切换 / 宿主机 / 日志级别
+
+上一批的结论是「英文字母」和「方案回退」只能靠猜——服务器 18 分钟只收到 1 条按键事件，
+而设置里那几行又看不出取值来源。这一批把**判断依据**补上，不猜。
+
+- [x] **`log_level` 终于生效**（server）。`xime-config` 的 `init_logging` 只看 `RUST_LOG`，
+  `XimeConfig::log_level` 这个配置项从来没人读；现在 server 在初始化日志**之前**把配置
+  级别写进 `RUST_LOG`（环境变量仍然优先）。没配 `log_level` 时**什么都不做**，保留
+  xime-config 「全局 info + 本项目各 crate debug」的默认值（别因为配置缺席把 debug 关掉）。
+  第三方 crate 一律留在 `info`，避免 librime 逐键日志把要找的行埋掉。
+- [x] **启动时记录配置文件路径 + 是否存在**（`Config file: ... (exists=...)`）：
+  遇到「改了配置没反应」先看这行，能立刻分辨「写的是不是这个文件」。
+- [x] **方案切换留痕**：`SelectSchema` 成功/失败都打印**引擎实际报的** schema
+  （`requested=moqi_wan_flypymo, engine=Some("emoji")` 这种），
+  `ReloadConfig`（redeploy）之后也打印一次 `active schema after redeploy`。
+  「部署完又回到 emoji」是引擎换了还是界面取错值，看这两行就能定性。
+- [x] **TSF 侧**：`Activate` 打印宿主进程名（`host=WINWORD.EXE tid=...`）——用户报
+  「按键没反应」时，第一步是确认 TIP 到底有没有被这个程序加载（没加载就不会调
+  `OnKeyDown`，按键一个都到不了 server）。英文态早退原来一声不响，现在补
+  `-> ascii mode, key passed through to the app`。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **107 passed / 0 failed / 1 ignored**。
+
+**复现方法（给用户）**：在 `%APPDATA%\xime\rime\xime.custom.yaml` 里加一行
+`log_level: trace`，重启 server（`rebuild.ps1` 或托盘退出后重开），复现问题后再看
+`%APPDATA%\Xime\logs\server.log` / `tsf.log`。日志级别改动**重启后生效**。
+
+### 2026-10-23 日志判读结论（用户复现后）：三个问题定性，一个已修
+
+日志：`server.log` 1838 行 / `tsf.log` 1180 行，`log_level: trace` 生效（553 条 TRACE）。
+
+- **① 方案切换其实是好的**（不再是猜测）：
+  `schema selected successfully: requested=moqi_wan_flypymo, engine=Some("moqi_wan_flypymo")`，
+  紧接着 `redeploy result: true, active schema after redeploy: Some("moqi_wan_flypymo")`。
+  启动时 `Active schema: moqi_wan_flypymo`。**引擎侧从头到尾都是 moqi，没回退。**
+- **② 「设置里显示 emoji」= 设置页的显示 bug（上游 `xime-setup`）**：
+  `input_schema.selected_schema` 是个**下标**，只在用户点行时赋值
+  （`app.rs:117`），启动时没人从服务端同步；而 `SchemaManager::get_schema_list()`
+  按**显示名排序**（`schema_manager.rs:112`），`Emoji` 的 ASCII 名排在所有中文名之前
+  → 下标 0 就是 emoji。所以列表永远把「Emoji」标成当前。**与引擎无关。**
+- **③ 「只有英文字母 + 卡顿」：找到一条真因 —— 服务进程把自己的 TIP 也加载了**。
+  `tsf.log`: `Activate: host=winxime-server.exe tid=56`。服务为注册 TSF profile 用了
+  `ITfInputProcessorProfileMgr`（`register.rs`），一碰 TSF 就成了宿主，系统把我们的
+  TIP 加载进**服务自己**；该实例连回自己发 `StartSession`/`FocusIn`/`FocusOut`，
+  而 `FocusOut` 会 `clear_composition()` + `window.hide()` → 用户正在打的组合被
+  「自己」清掉、候选栏闪没；同时反复 `Show/HideTrayIcon`，日志里的
+  `Client connected!` 风暴（05:27:48–05:27:53 每 0.8–1s 一轮）就是这么来的。
+- [x] **修复：TSF 侧识别「宿主就是服务自身」并彻底不干活**。
+  新增 `XimeTextService.self_host`（`Cell<bool>`）：`activate_impl` 里
+  `host == "winxime-server.exe"` 时只记 `thread_mgr`/`client_id` 就返回，
+  **不连 IPC、不注册按键 sink、不碰托盘**；`OnActivated` / `OnSetFocus` /
+  `process_key_event` 三处再加防御性早退（这两个 sink 会自己 `ipc.connect()`，
+  只在 activate 里挡是不够的）。
+- **顺带确认**：这次日志里打字是**通的** —— `handled: true`、`input` 增长、
+  候选是中文（如 `双` / `双拼`），说明 moqi 方案本身可用；缺 lua 只影响它的
+  lua 组件（注释格式、农历、计算器等），不影响基本组词上次序。
+  之前「只有英文字母」更可能是当时引擎停在 `.default`（未部署）+ 自宿主干扰叠加。
+- **验证**：`cargo build --quiet` 无输出；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **107 passed / 0 failed / 1 ignored**。
+- **待办（需要动上游 `libximecore`，未做）**：给 `xime-setup` 加一个
+  `set_notify_current_schema(fn() -> Option<String>)` 回调，`reload_schemas()` 之后按
+  服务端 `status.schema_id` 反查下标（找不到才退回 0）；`winxime-setup` 侧用
+  `IpcClient` 实现它。这样「当前方案」才与引擎一致。
+
+### 2026-10-23 设置页「当前方案」对齐引擎（修 emoji 误标）
+
+- **根因回顾**：`xime-setup` 的 `input_schema.selected_schema` 是**下标**，只在用户点行时
+  赋值；启动时没人从服务端同步，而方案列表按**显示名**排序
+  （`schema_manager.rs:112`），`Emoji` 这类 ASCII 名永远排最前 → 下标 0 恒指向 emoji。
+  用户实测：引擎一直是 moqi（`Active schema` / `engine=Some("moqi_wan_flypymo")` 均已证实），
+  界面却标 emoji —— 纯显示问题。
+- [x] **上游 `libximecore`（2 个文件，本地未提交）**：
+  - `crates/xime-setup/src/state.rs`：新增
+    `static NOTIFY_CURRENT_SCHEMA: OnceLock<fn() -> Option<String>>` +
+    `set_notify_current_schema()` + 私有 `notify_current_schema()`；
+    `reload_schemas()` 赋完 `available_schemas` 后按服务端方案 id 反查下标
+    （查不到就保留原下标，绝不硬改）。因为 `SettingsState::new()` 是
+    `load_schemas()` → `load_schema_config()` 的顺序，同步下标后配置也跟着对。
+  - `crates/xime-setup/src/lib.rs`：导出新回调。
+- [x] **本仓库**：
+  - `winxime-ipc/messages.rs`：新增 `IpcCommand::GetStatus`（只读，不建会话）；
+  - `winxime-ipc/pipe.rs`：`IpcClient::get_status() -> Option<Status>`（快命令超时）；
+  - `winxime-server/ipc_server.rs`：`GetStatus` → `get_ipc_status(&eng)`；
+  - `winxime-setup/main.rs`：注册
+    `set_notify_current_schema(|| IpcClient::get_status().map(|s| s.schema_id))`。
+- **副作用说明**：`reload_schemas()` 现在会发一次 IPC（设置页启动、装/卸方案后各一次）；
+  服务没起时 `connect` 立即失败（`ERROR_FILE_NOT_FOUND`），不会等满超时。
+- **验证**：`cargo build --quiet` 无输出（含被 patch 的上游 crate）；
+  `cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **107 passed / 0 failed / 1 ignored**。
+- **待用户验证**：重开设置页，「当前方案」应显示 `moqi_wan_flypymo`（引擎实际值），
+  切换后再重开仍应一致；服务未运行时退回原行为（标第一行），不报错。
+
+### 2026-10-23 用户配置文件语义（`xime.custom.yaml` 只存差异 + 三种恢复 + 撤销）
+
+**问题**：外观页点一下，`%APPDATA%\xime\rime\xime.custom.yaml` 就被整份覆盖——
+5KB 的 `wubi_radicals`、全套内置配色、`pair_secret` 全灌进去；用户自己写的段
+（移动端的 `keyboard:`、`metadata:` 等）直接消失。
+
+- [x] **上游 `xime-config` 重写存取语义**（新增 `user_config.rs`）：
+  - `load()` 改为**按 YAML 树深合并**（内置 → 系统级 → 用户级）。原来按结构体字段
+    替换：用户只写 `style.font_size` 时，`style` 其它字段会被 `[serde(default)]`
+    打回硬编码默认，系统级配置也跟着失效。
+  - `save()` 只写**与默认值的差异**：以「内置 + 系统级」为基线做 `deep_diff`，
+    受管键 = 结构体能序列化出来的顶层键（新增字段自动纳管）。
+  - **保留未知键**：写入时先摘掉受管键，再把差异并进现有文件树，`keyboard:` 这类
+    我们结构体里没有的段原样保留（这是之前真正的数据丢失点）。
+  - 差异为空 → 删掉用户文件，回到「初始安装没有这个文件」的状态。
+- [x] **快照与恢复**：
+  - `.bak`：每次写入前一份 → 「撤销上一次修改」；
+  - `.orig`：**只在第一次改写「不是程序生成的文件」**时留（靠文件头 `# xime-user-config`
+    标记判断），→ 「恢复为用户提供的配置」；
+  - 「恢复默认配置」= 删除用户文件（删前也留 `.bak`，保证可撤销）。
+- [x] **设置页（外观 → 操作）**新增三个按钮：撤销上一次修改 / 恢复为用户提供的配置 /
+  恢复默认配置；按 `ConfigFileState`（文件/快照是否存在）决定可点状态。
+  恢复后自动重读界面字段 + 通知宿主重载样式。
+- [x] **顺手修掉一个快照粒度问题**：`SaveAppearance` 原来先 `save_color_scheme()` 再
+  `save_appearance()`，两次写 = 两份快照，「撤销」只能退一半。现在配色与字号/候选数/
+  圆角在同一次 `save()` 里写。
+- **验证**：
+  - `xime-config` 单测 **32 passed**（新增 7 项：只写差异 / 保留未知键 / 改回默认删键 /
+    `.orig` 只留一次 / 撤销与两种恢复 / 深合并按 key / 差异计算）。
+  - `cargo build --quiet` 无输出；`cargo test --workspace` = **107 passed / 1 ignored**；
+    `cargo clippy`（workspace 与两个被改的上游 crate）除既有的 `theme.rs:55` 折叠建议外无新告警。
+- **待用户验证**：改外观 → 文件里应只有改过的键；撤销/恢复三个按钮的行为；
+  方案包里自带的 `xime.custom.yaml` 在第一次保存后应原样出现在 `.orig` 里。
+
+### 2026-10-23 外观设置「候选数量 / 圆角」真正生效（并答疑：配置没错，是软件的问题）
+
+用户现象：设置里字号生效，`candidate_count: 7`、`corner_radius: 0` 不生效；
+文件里还有 `key.corner_radius` / `shadow.enabled` 两段（在 `keyboard:` 下）。
+
+- **定性**：配置基本没错，两个是软件缺陷、一个是文档误区：
+  1. `style.candidate_count` 是文档字段（"候选栏同时显示的候选词数量，仅 PC"），
+     但 Windows 端只把它当"每行列数"（`cand_per_row`），而且 rime 的
+     `menu/page_size` 只有 5 → 一页就给 5 个，设 7 也不会多出来。
+  2. `style.corner_radius` **文档里没有**，但设置页的「圆角大小」一直把值写进
+     `style.corner_radius`，而绘制端写死 8.0 / 10.0，从来没读过。
+  3. `key.corner_radius` / `shadow` 按文档属于 `keyboard.key`、`keyboard.shadow`，
+     只作用于**手机虚拟键盘**，与 Windows 候选窗无关（用户那份确实在 `keyboard:` 下，
+     位置是对的，只是 PC 不用）。
+- [x] **圆角接进绘制**：`CandidateModel` / `RootModel` 新增 `corner_radius`
+  （取自 `style.corner_radius`，夹 0..32），`paint.rs` 三处硬编码（候选栏 8.0、
+  面板 10.0、字根浮层走同一变量）改为读模型；`draw_drop_shadow` 一并跟随。
+- [x] **候选数量按文档语义**：
+  - `ui/model.rs` 按 `candidate_count` 截断 `items` / `comments`（显示上限）；
+  - **关键**：`menu/page_size` 必须 ≥ 显示数量，否则 rime 一页就给不出那么多。
+    新增 `xime_config::set_page_size_in(user_dir, n)`：只改 `default.custom.yaml`
+    的 `patch.menu.page_size`，其它 patch 原样保留，已一致则返回 `false` 不重复写。
+  - 服务端在**启动部署前**与 **ReloadConfig 部署前**各同步一次；设置页改候选数量时
+    `save_appearance` 会自动触发一次部署（其它外观项靠配置缓存 mtime 即时生效，
+    不需要部署）。
+- **验证**：`xime-config` 单测 **33 passed**（新增 `page_size_written_without_touching_other_patch_keys`：
+  只改 page_size、保留 schema_list、幂等）；`cargo build --quiet` 无输出；
+  `cargo test --workspace` = **107 passed / 1 ignored**；clippy 0 warning。
+- **待用户验证**：改 7 → `default.custom.yaml` 出现 `page_size: 7`，候选栏应显示 7 个；
+  圆角 0/8/16 应肉眼可见变化（0 = 直角）。
+- **待办**：`xime-docs` 的 `style` 一节补上 `corner_radius`（当前文档只有
+  font_size / candidate_count / show_code_hint / horizontal / color_scheme）。
+
+#### 追加：`candidate_count` 仍只出 5 个 —— 真因是 `page_size` 属于**方案级**
+
+用户实测：`default.custom.yaml` 已写入 `menu.page_size: 7`，`build/default.yaml` 也是 7，
+候选栏照样 5 个；但圆角已生效。
+
+- **根因**：`menu/page_size` 是**方案配置**。这个方案包在自己的
+  `moqi_wan_flypymo.schema.yaml` 里写死 `menu: page_size: 5`，
+  而 rime 的层级是「方案配置 > default 配置」，所以 `default.custom.yaml` 的 patch
+  压不过它。（圆角之所以生效，是因为它走 xime 自己的配置，跟 rime 无关。）
+- [x] 新增 `xime_config::set_schema_page_size_in(user_dir, n)`：读 `default.custom.yaml`
+  的 `schema_list`，给每个方案写 `<schema>.custom.yaml` 的
+  `patch.menu.page_size`（只动这一个键，已有 patch 全保留；方案名做路径校验；
+  已一致返回 0）。这是 rime 的正规做法（`*.custom.yaml` 是方案补丁层）。
+- [x] 服务端 `sync_rime_page_size` 现在两步都做：默认层（`default.custom.yaml`）+
+  方案层（逐个 `<schema>.custom.yaml`），启动部署前与 ReloadConfig 部署前各同步一次。
+- **验证**：`xime-config` 单测 **34 passed**（新增
+  `schema_page_size_patched_per_schema`：两个方案都打上 patch、保留方案原有 patch、幂等）；
+  `cargo build --quiet` 无输出；`cargo test --workspace` = **107 passed / 1 ignored**；clippy 0。
+- **副作用（已记录）**：会在 rime 目录生成/更新 `<schema>.custom.yaml`（目前 4 个方案）。
+  想回到方案自带的分页大小，删掉对应 `<schema>.custom.yaml` 里的 `menu.page_size` 即可。
+
+#### 收口：`page_size` 只写 `default.custom.yaml`，选字键 1–9 + 0
+
+用户决策：删掉方案里写死的 `page_size`（客户端只改 `default.custom.yaml`），
+不要生成一堆 `<schema>.custom.yaml`；选字键补到 9，第 10 个用 0。
+
+- [x] **撤掉方案级 patch**：删除 `set_schema_page_size_in` 及其单测/导出，
+  服务端只调 `set_page_size_in`（默认层）。
+- [x] **`default.custom.yaml` 按「Xime 固定配置」对待**：写入时带固定说明头
+  （"Xime固定配置…请勿在此手工调整"），与 Android 侧约定一致；只 patch
+  `menu.page_size`，其它 patch 节原样保留。
+- [x] **选字键 1–9 + 0**：`selkeys` 由 5 个扩到 10 个（`'1'..='9'` + `'0'`）。
+  librime 的 selector 原生就是 `index = ((ch - XK_0) + 9) % 10`，所以 `0` = 第 10 个，
+  不需要额外 key_binder。
+- [x] **上限 10**：显示截断、`set_page_size_in`、设置页滑杆（原来 1–20）统一成 1–10；
+  再多也没有键可点，显示出来只占位置。
+- [x] **能力诊断**：部署后核对 `build/<schema>.schema.yaml` 的 `menu.page_size`，
+  与期望不一致时 `warn!` 点名方案与文件（"删掉 `<id>.schema.yaml` 里的 menu.page_size"）。
+  这是这次"设置不生效"最容易反复踩的坑。
+- **验证**：`xime-config` 单测 **33 passed**（page_size 用例补了文件头断言）；
+  `cargo build --quiet` 无输出；`cargo test --workspace` = **107 passed / 1 ignored**；clippy 0。
+- **待用户验证**：删掉 `moqi_wan_flypymo.schema.yaml` 里的 `menu.page_size` →
+  `rebuild` → 候选栏按设置显示（≤10），第 10 个候选标 `0.`。
+- [x] **用户验收通过（2026-10-23）**：候选数量按设置显示、第 10 个候选标 `0.` 且可用；
+  圆角生效；`default.custom.yaml` 只有一份（没有生成 `<schema>.custom.yaml`）。
+
+### 2026-10-23 系统通知服务（统一入口 + 去重/限流 + 事件接线）
+
+用户要求：「配置变动或重要过程要有一条面向普通用户的系统通知，让用户了解运行情况」。
+
+- 现状盘点：WinRT toast 基础设施早就有了（`toast.rs`，需要 MSIX 包身份，非打包环境静默跳过），
+  但调用点零散（面板 3 处 + 设置页转发 1 处），没有去重、没有限流、日志里也查不到。
+- [x] 新增 `crates/winxime-server/src/notify.rs`（统一入口）：
+  - **同一内容 10 秒内只弹一次**（去重，`debug` 留痕）；
+  - **10 秒内最多 3 条**（限流，超出的 `warn` 留痕，不静默吞）；
+  - 每次真正弹出都记 `info!("通知: 标题 — 内容")`，排查"到底弹没弹"有据可查；
+  - 限流状态抽成 `Throttle`（注入 `Instant`），纯逻辑可单测。
+- [x] **所有 toast 收口**：`handle_show_toast`（设置页转发的也在内）、面板 3 处占位提示
+  全部改走 `notify`。
+- [x] **接线的重要事件**：
+  - 部署结果（`ReloadConfig` → "已部署「方案名」" / "部署失败，详见 server.log"）；
+  - 方案切换失败（`SelectSchema` 未部署时 → "切换方案失败：「id」未部署"）；
+  - 托盘「用户资料同步」（完成 / 失败）。
+- **没接的（有意）**：字号/配色保存（设置窗口已就地提示，弹 toast 反而吵）、
+  语音模型下载完成（语音相关验收暂停，等那批一起做）、配置恢复/撤销（同上，窗口内提示已够）。
+- **验证**：`cargo build --quiet` 无输出；clippy 0 warning；
+  `cargo test --workspace` = **108 passed / 0 failed / 1 ignored**（新增 2 项：去重、限流）。
+- **待用户验证**：点「部署方案」→ 一条通知；10 秒内连点两次 → 只弹一条（第二次走 debug 去重）；
+  点托盘「同步用户资料」→ 完成/失败通知。
+
+#### 追加：点部署没有通知 —— WinRT toast 要包身份，MSI/开发直跑没有
+
+日志里 `通知: 曦码·曜 — 已部署「墨齐·双拼」` 是有的（`notify` 走了），但屏幕上没有：
+`toast::show_toast` 的 `package_aumid()` 返回 `None` 时**静默 return**。
+
+- **根因**：`GetCurrentPackageFullName` 只有**通过应用模型启动**的进程才有包身份。
+  - MSI 装到 `Program Files` 的进程：没有包身份 → WinRT toast 永远不可用；
+  - `rebuild.ps1` 用 `Start-Process` 直接跑 `target\msix-pkg\winxime-server.exe`：
+    同样没有包身份（注册了包 ≠ 直接跑 exe 就有身份）。
+  所以这条路径从来没真正弹出过，而且**失败是静默的**。
+- [x] **托盘气泡回退**（`tray::show_balloon`）：`NIF_INFO` 走老 API，不依赖包身份，
+  Win10/11 一样进通知中心；只要托盘图标在就能用。
+  - `TRAY_HWND` 是 `static mut`，跨线程读是 UB，单独加了 `TRAY_HWND_RAW: AtomicIsize`
+    给通知线程用（install 存、cleanup 清零）。
+- [x] `toast.rs` 改成：有包身份 → WinRT toast；失败或无身份 → 托盘气泡；
+  两条都不行才 `warn!`（不再静默）。无身份走气泡时留一条 `debug`。
+- **验证**：`cargo build --quiet` 无输出；clippy 0 warning；
+  `cargo test --workspace` = **108 passed / 1 ignored**。
+- **待用户验证**：`rebuild.ps1` 后点「部署方案」应看到托盘气泡通知；
+  10 秒内连点第二次只有一条（去重）。
+- **已知边界**：MSI 安装的用户若在系统设置里关掉了通知/专注助手开着，气泡会被系统吞掉——
+  这是用户侧设置，不是程序问题（日志里仍有 `通知: ...` 一行）。
+
+#### 追加 2：托盘气泡也不显示 —— 改成「AUMID + 开始菜单快捷方式」发真通知
+
+日志已经走到气泡分支（`DEBUG 系统通知走托盘气泡…`），`Shell_NotifyIconW` 也返回成功，
+但 Win11 不显示：legacy 气泡受系统通知设置/专注助手影响，且在新系统上越来越不可靠。
+
+- **正解**：Win32（无包身份）应用发 toast 的官方做法是——开始菜单里放一个带
+  `System.AppUserModel.ID` 的快捷方式，Windows 按这个 AUMID 认领应用（名字/图标都从它来）。
+- [x] `toast.rs` 新增 `ensure_start_menu_shortcut()`：
+  - 建 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\曦码·曜.lnk`，
+    **指向 `winxime-setup.exe`**（点开进设置；指到 server 会重启服务，容易误触）；
+  - 用 `IShellLinkW` + `IPropertyStore` 写 `PKEY_AppUserModel_ID`
+    （`{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}`, pid 5；windows-rs 没生成这个常量，手写）；
+  - AUMID 固定为 `XimeYao.InputMethod`；每个进程只建一次（`OnceLock`）。
+- [x] 取 AUMID 的顺序：**包身份**（MSIX）→ **快捷方式 AUMID** → 托盘气泡（最后兜底）。
+  失败不再静默：建快捷方式失败 `warn!`，WinRT 失败 `warn!` 并退回气泡。
+- **依赖**：`windows` 增加 `Win32_UI_Shell_PropertiesSystem` feature。
+- **验证**：`cargo build --quiet` 无输出；clippy 0 warning；
+  `cargo test --workspace` = **108 passed / 1 ignored**。
+- **待用户验证**：`rebuild.ps1` 后点部署 → 应出现正常 toast（应用名「曦码·曜」）；
+  开始菜单会多一条「曦码·曜」（指向设置程序，第一次发通知时创建）。
+- **遗留**：`full-uninstall.ps1` 还没删这个快捷方式（下一步补）。
+- [x] **用户验收通过（2026-10-23）**：部署/同步等事件能弹出系统通知（应用名「曦码·曜」），10 秒内重复事件被去重。
+- [x] `full-uninstall.ps1` 增加「Step 4b：删除通知用开始菜单快捷方式」，并纳入卸载校验清单。
+- **已知缺口**：MSI 卸载（WiX）还不会删这个 `.lnk`（文件在用户开始菜单、不在安装目录）；需要时再加自定义动作。
+- [x] **用户验收通过（2026-10-23）**：扩展商店能列出方案（默认方案/仓颉/明月拼音/雾凇/白霜/万象…），符号输入（`/fh` 等）正常。
+
+### 2026-10-23 librime-lua：把 lua 组件编进 rime.dll
+
+moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator），而我们的
+`rime.dll` 里一个 lua 符号都没有（`lua_translator` 等全部 MISSING）。
+
+- **调研结论**：上游唯一受支持的落点是 `librime/plugins/<name>`——
+  - `rime/librime` 的 `action-install-plugins-windows.bat`：
+    `git clone <plugin> plugins\<librime- 前缀去掉的名字>`；
+  - librime-lua 的 CI 通过 `rime_plugins` 输入走同一个脚本；
+  - 插件 `CMakeLists.txt` 用 `PARENT_SCOPE` 把 `plugin_objs/deps/modules` 交回 librime
+    合并进 `rime.dll`，脱离 `add_subdirectory` 无法构建。
+- [x] **不改 librime 源码的挂法**：插件 clone 到仓库外
+  `D:\project\third_party\librime-lua`（含 `thirdparty/lua5.4`，来自插件的
+  `thirdparty` 分支），再用**目录联接**挂到 `librime/plugins/lua`。
+  - `git -C librime status` 无被跟踪改动（`plugins/lua` 不进版本库）；
+  - `librime/build`、`librime/dist` 本来就是构建产物，插件目录属同类构建输入；
+  - 回退 = 删联接 + 重编。
+- [x] **构建链修了一个坑**：`librime-sys2/build.rs` 的 `cmake --build` 没传
+  `--config Release`，VS 多配置生成器会默认打 Debug → `MSB8013: 此项目不包含配置
+  和平台组合 Debug|x64`。已补上 `--config Release`。
+- [x] **防呆**：`rebuild.ps1` / `msi-build.ps1` 启动时检查
+  `../libximecore/librime/plugins/lua/CMakeLists.txt`，缺了就黄字提示
+  「rime.dll 将不含 lua 组件」。
+- **验证**：`rime.dll` 2 871 296 → 3 521 024 字节；
+  `lua_translator` / `lua_filter` / `lua_processor` / `LuaComponent` 符号全部 FOUND；
+  `cargo build --quiet` 无输出；`cargo test --workspace` = **108 passed / 1 ignored**。
+- **待用户验证**（需 `rebuild.ps1` 重新暂存 rime.dll）：moqi 方案里 lua 提供的功能——
+  日期（`rq`）、农历、计算器（`12+34`）、数字/金额转换、注释格式（`pro_comment_format`）。
+- **已知代价**：`rime.dll` 增大约 650KB，MSI/MSIX 体积相应增加；lua 5.4 源码随插件
+  `thirdparty` 分支提供（不在我们仓库里）。
+
+### 2026-10-23 小键盘键码错位 / rime.dll 没换新（lua「测试不成功」的真因）
+
+用户反馈：小键盘的 `/`、`1` 等打出来的不是目标字符；lua 也测不出效果。
+
+- **① 小键盘键码错位（`crates/librime/src/key.rs`）**
+  `VK_NUMPAD0..9` 是 `0x60..=0x69`，与 ASCII 小写字母区**数值重叠**；原实现先匹配
+  `0x61..=0x7A`（当作"小写字母"），于是：
+  - 小键盘 `1`（0x61）→ `XK_A` → 打出 `a`；
+  - 小键盘 `/`（`VK_DIVIDE` = 0x6F）没有任何分支 → 走 `_ => vk` 变成 ASCII `0x6F` → `o`；
+  - `*`/`+`/`-`/`.` 同理错位。
+  而 Windows 的字母 VK 一直是 `0x41..=0x5A`（大写区），`0x61..=0x7A` 这个分支本身就是错的。
+  修法：**小键盘分支前置**并补齐 `VK_DECIMAL/DIVIDE/MULTIPLY/ADD/SUBTRACT` →
+  X11 `KP_*` keysym（rime 的 `key_binder` 里 `KP_0`/`KP_Divide` 正是这些名字）；
+  删除那个"小写字母"分支。新增两个单测（小键盘 8 个键 + 字母仍在 0x41..0x5A），
+  并改掉一个**断言旧错误行为**的测试。
+- **② `rime.dll` 从来没被换新（lua 无效的真因）**
+  `librime-sys2/build.rs` 把 `dist/lib/rime.dll` 复制到 `librime.parent()/target/{debug,release}`
+  —— 那是 **libximecore 的 target**；而 `msix-bundle.ps1` 是从
+  **`XimeYao/target/<profile>/rime.dll`** 暂存的。结果：我们编出了带 lua 的 3.52MB dll，
+  实际打包进 MSIX 的一直是 9:20 那个 2.87MB 旧文件。
+  改为用 cargo 的 `OUT_DIR` 反推当前构建目录（`<target>/<profile>/build/<pkg>-<hash>/out`
+  上溯 3 级），复制到 exe 旁边；复制失败会 `cargo:warning` 明说。
+- **验证**：`librime` 单测 **24 passed**（含新增 2 项）；`cargo test --workspace` =
+  **108 passed / 1 ignored**；clippy 0 lint；`target/release/rime.dll` = **3 521 024 字节**
+  （含 `lua_translator`/`lua_filter`/`lua_processor`/`LuaComponent`）。
+- **待用户验证**：`rebuild.ps1` 后 ① 小键盘 `/`、`1`~`9`、`*`、`+`、`-`、`.` 正常；
+  ② moqi 方案的 lua 功能（农历/日期/计算器等）。
+
+### 2026-10-23 Shift+字母必须报大写 keysym（计算器/农历等大写触发器的真因）
+
+用户反馈：`V` + `1+2` 没进缓冲（日志里只有 `input: Some("v")`），lua 计算器不触发。
+
+- **证据**：`server.log` 里 `Key: 118 mod: 1`（118 = 小写 `v`，1 = `kShiftMask`）→
+  `input: Some("v")`。rime 的 speller 是**按 keysym 字符**入缓冲的，不会因为 modifier
+  里有 Shift 就把小写变大写；而我们 `vk_to_xk_shifted()` 之前对字母 `return None`
+  （注释写"字母不参与，移位语义由 SHIFT 修饰位承载"——对 rime 不成立）。
+- **后果**：所有依赖**大写触发器**的方案功能全部失效——`calculator: trigger: V`、
+  `^N[0-9]{1,8}`（公历转农历）、`^R...`（数字/金额）、`^U...`（Unicode）。
+  这套方案没有单独的 `calculator` recognizer 规则，靠的是 `uppercase: "^[A-Z].*$"`
+  把大写开头的整段吃进缓冲；输入永远是小写 → 规则永远不匹配。
+- [x] 修：`vk_to_xk_shifted` 增加字母分支（Shift+A → `'A'` keysym），符号/数字映射不变。
+  新增 2 个单测（Shift 字母大写、Shift 符号不变）。
+- **验证**：`winxime-tsf` 单测 2 passed；`cargo test --workspace` = **110 passed / 1 ignored**；
+  clippy 0 lint；`cargo build --release` 通过。
+- **待用户验证**：`Shift+V` + `1+2` → 候选出结果；`Shift+N` + 8 位日期 → 农历；
+  `Shift+R` 数字转换；`Shift+U` unicode。
+
+### 2026-10-23 收尾：遗留清单（下一批从这里继续）
+
+今天的改动都已按功能点验证过（`cargo build --quiet` 无输出、clippy 0 lint、
+`cargo test --workspace` = 110 passed / 1 ignored）。下面是没有做的部分：
+
+1. **Xime 内置计算器（方案无关）** —— 用户已确认作为遗留项。
+   - 背景：方案自带计算器（本包 `calculator: trigger: V`）依赖 lua 而且在真机上依赖
+     `recognizer/patterns/uppercase` 把大写开头的整段吃进缓冲；换方案就可能失效。
+   - 计划：先做 **B1 触发前缀**（默认 `=`，Xime 自维护计算缓冲 + 现有候选窗 + 上屏），
+     跑通后演进到 **B2 自动识别**（数字开头的影子缓冲，出现运算符才接管；非算式要把
+     暂存数字补发给应用——延迟提交是难点）。
+2. **MSI 卸载不会删通知用的开始菜单快捷方式**（`full-uninstall.ps1` 已删）。
+   要覆盖需要在 WiX 里加自定义动作，等有 MSI 实装验证窗口再做。
+3. **`xime.custom.yaml` 保存不保留注释**（YAML 树读写的固有取舍，已写进 DECISIONS）。
+4. **rime 日志**：当前 `rime.dll` 是 `ENABLE_LOGGING=OFF` 编的，lua 脚本内部报错看不到；
+   需要时加一个构建开关（`-DENABLE_LOGGING=ON`，日志落 `%TEMP%\rime.xime\`）。
+5. **语音相关验收**：P5 ③（4K/窄窗口观感）与 ④（下载模型 → 切换 → 试听 → 🎙️ 上屏）
+   仍待用户目视/真机验证。
+6. **`libximecore` 改动需各端回归**：配置 save/load 语义（差异写入 + 树合并）是共用核心，
+   Android/Linux/macOS 客户端需验证「改设置 → 保存 → 重开」与恢复/撤销按钮。

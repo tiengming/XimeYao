@@ -119,18 +119,25 @@ impl PluginHost {
             );
         }
     }
+}
 
+/// 云备份：宿主负责打包 rime 用户数据，传输交给 `backup` 类插件。
+///
+/// 实现完整（含单测），但 **尚未接 IPC 命令和设置页入口**，`cargo build`
+/// 会把它当死代码。等接线时删掉这个 `allow`，别让它长期挂着。
+#[allow(dead_code)]
+impl PluginHost {
     // ---- 云备份（宿主打包，插件传输）----
 
     /// 打包 rime 用户数据为 zip（跳过可再生的 build/ 目录）。
     /// 条目前缀 `rime/`，与 Xime 的备份包布局一致（恢复时去掉前缀落回 rime 目录）。
     pub fn build_backup_archive(&self) -> Result<(String, Vec<u8>), String> {
-        let file_name = format!("Xime备份-{}.zip", local_date_string());
+        let file_name = format!("Xime备份-{}.zip", Self::local_date_string());
 
         let file = Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
-        add_dir_to_zip(&mut zip, &self.rime_dir, "rime", options)?;
+        Self::add_dir_to_zip(&mut zip, &self.rime_dir, "rime", options)?;
 
         let cursor = zip
             .finish()
@@ -213,8 +220,68 @@ impl PluginHost {
             .ok_or_else(|| "未安装已启用的 backup 类插件".to_string())
     }
 
+    /// 递归把目录写进 zip（`prefix` 为包内路径前缀）。
+    fn add_dir_to_zip<W: std::io::Write + Seek>(
+        zip: &mut zip::ZipWriter<W>,
+        dir: &Path,
+        prefix: &str,
+        options: zip::write::SimpleFileOptions,
+    ) -> Result<(), String> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("读取 {} 失败: {}", dir.display(), e))?;
+        for entry in entries.flatten() {
+            let name = format!("{}/{}", prefix, entry.file_name().to_string_lossy());
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    // build/ 为部署产物，可再生，不进备份包
+                    if entry.file_name() == "build" {
+                        continue;
+                    }
+                    Self::add_dir_to_zip(zip, &entry.path(), &name, options)?;
+                }
+                Ok(t) if t.is_file() => {
+                    let bytes = std::fs::read(entry.path())
+                        .map_err(|e| format!("读取 {} 失败: {}", entry.path().display(), e))?;
+                    zip.start_file(&name, options)
+                        .map_err(|e| format!("zip 写入 {} 失败: {}", name, e))?;
+                    zip.write_all(&bytes)
+                        .map_err(|e| format!("zip 写入 {} 失败: {}", name, e))?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// 本地日期 YYYY-MM-DD（civil_from_days，无外部时间依赖）。
+    fn local_date_string() -> String {
+        let days = (Self::unix_secs() / 86400) as i64;
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
+}
+
+impl PluginHost {
     // ---- 剪贴板同步（宿主监听+去重，插件传输）----
 
+    /// 当前是否选中了可用的剪贴板同步插件（目前只有单测在用）。
+    #[cfg(test)]
     pub fn has_clipboard_sync(&self) -> bool {
         self.resolve_clipboard_plugin().is_some()
     }
@@ -240,14 +307,6 @@ impl PluginHost {
     }
 
     // ---- 内部 ----
-
-    fn has_typed_plugin(&self, plugin_type: &str) -> bool {
-        self.enabled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|p| p.plugin_type == plugin_type)
-    }
 
     /// 解析剪贴板同步应使用的插件。
     /// 选型来源 clipboard_sync.toml（设置程序写入，与 Android daemon 契约一致）：
@@ -542,37 +601,6 @@ fn install_bundled(manager: &PluginManager, bundled_dir: &Path) {
     }
 }
 
-fn add_dir_to_zip<W: std::io::Write + Seek>(
-    zip: &mut zip::ZipWriter<W>,
-    dir: &Path,
-    prefix: &str,
-    options: zip::write::SimpleFileOptions,
-) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取 {} 失败: {}", dir.display(), e))?;
-    for entry in entries.flatten() {
-        let name = format!("{}/{}", prefix, entry.file_name().to_string_lossy());
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {
-                // build/ 为部署产物，可再生，不进备份包
-                if entry.file_name() == "build" {
-                    continue;
-                }
-                add_dir_to_zip(zip, &entry.path(), &name, options)?;
-            }
-            Ok(t) if t.is_file() => {
-                let bytes = std::fs::read(entry.path())
-                    .map_err(|e| format!("读取 {} 失败: {}", entry.path().display(), e))?;
-                zip.start_file(&name, options)
-                    .map_err(|e| format!("zip 写入 {} 失败: {}", name, e))?;
-                zip.write_all(&bytes)
-                    .map_err(|e| format!("zip 写入 {} 失败: {}", name, e))?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -580,38 +608,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// 本地日期 YYYY-MM-DD（civil_from_days，无外部时间依赖）。
-fn local_date_string() -> String {
-    let days = (unix_secs() / 86400) as i64;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_root(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("winxime_plugins_{label}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap_or_default();
-        dir
+        crate::test_support::test_root(&format!("plugins_{label}"))
     }
 
     fn write_minimal_plugin(root: &Path, id: &str, plugin_type: &str) {
@@ -726,19 +728,13 @@ plugin_id = \"test.clip\"
         }
         let manifest = match PluginManifest::from_dir(&dir) {
             Ok(m) => m,
-            Err(e) => {
-                assert!(false, "manifest 解析失败: {e}");
-                return;
-            }
+            Err(e) => panic!("manifest 解析失败: {e}"),
         };
         assert_eq!(manifest.name, "WebDAV 剪贴板同步");
-        let config = std::env::temp_dir().join(format!("xime_schema_test_{}.yaml", std::process::id()));
+        let config = crate::test_support::test_root("plugins_schema").join("plugin_config.yaml");
         let runtime = match PluginRuntime::load(&dir, &manifest.entry, &config) {
             Ok(rt) => rt,
-            Err(e) => {
-                assert!(false, "插件加载失败: {e}");
-                return;
-            }
+            Err(e) => panic!("插件加载失败: {e}"),
         };
         runtime.call_on_load();
         let fields = runtime.get_settings_schema();

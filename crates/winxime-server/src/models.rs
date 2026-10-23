@@ -58,10 +58,7 @@ mod tests {
     use super::*;
 
     fn temp_root(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xime_models_{}_{}", label, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("rime")).unwrap();
-        dir
+        crate::test_support::test_root(&format!("models_{label}"))
     }
 
     #[test]

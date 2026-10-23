@@ -86,15 +86,9 @@ pub fn profile_files(profile: &AsrModelProfile) -> Vec<&str> {
 mod tests {
     use super::*;
 
-    /// 测试用数据根：仓库 `target/test-tmp/`（本环境 Rust 测试进程不能在
-    /// `%TEMP%` 建目录，见 PROGRESS 环境坑 3），`rime/` 子目录模拟 rime 用户目录。
+    /// 测试用数据根（统一走 `test_support`，见其模块注释）。
     fn temp_root(label: &str) -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/test-tmp")
-            .join(format!("speech_settings_{label}"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::create_dir_all(root.join("rime"));
-        root
+        crate::test_support::test_root(&format!("speech_settings_{label}"))
     }
 
     #[test]

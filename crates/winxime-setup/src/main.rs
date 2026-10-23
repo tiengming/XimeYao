@@ -52,8 +52,7 @@ fn main() {
                     .chain(std::iter::once(0))
                     .collect();
                 let hwnd = FindWindowW(PCWSTR(class_wide.as_ptr()), PCWSTR(title_wide.as_ptr()));
-                if hwnd.is_ok() {
-                    let hwnd = hwnd.unwrap();
+                if let Ok(hwnd) = hwnd {
                     if !hwnd.0.is_null() {
                         if IsIconic(hwnd).as_bool() {
                             let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -76,6 +75,11 @@ fn main() {
 
     xime_setup_lib::set_notify_select_schema(|schema_id| {
         IpcClient::select_schema(schema_id)
+    });
+    // 「当前方案」以服务端为准：方案列表按显示名排序，光靠下标记会一直标到
+    // 字母序最前的方案（Emoji），与服务端实际在用的对不上。
+    xime_setup_lib::set_notify_current_schema(|| {
+        IpcClient::get_status().map(|status| status.schema_id)
     });
     xime_setup_lib::set_notify_deploy(|| {
         let _ = IpcClient::reload_config();

@@ -15,7 +15,7 @@ mod view;
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, trace, warn};
 
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -172,7 +172,7 @@ impl CandidateWindow {
                     *self.view.borrow_mut() = Some(view);
                 }
                 Err(e) => {
-                    info!("Failed to initialize UI: {}", e);
+                    error!("候选栏 Direct2D 初始化失败: {}", e);
                 }
             }
         }
@@ -181,8 +181,8 @@ impl CandidateWindow {
     pub fn show(&self, x: i32, y: i32) {
         self.ensure_view_initialized();
         if let Some(view) = self.view.borrow().as_ref() {
-            info!(
-                "  show: hwnd={:?}, moving to ({}, {})",
+            trace!(
+                "show: hwnd={:?}, moving to ({}, {})",
                 view.hwnd.0,
                 x,
                 y + 24
@@ -197,12 +197,11 @@ impl CandidateWindow {
                     0,
                     SWP_NOSIZE | SWP_NOACTIVATE,
                 );
-                info!("  show: posting WM_SHOW_CANDIDATE");
                 let result = PostMessageW(Some(view.hwnd), WM_SHOW_CANDIDATE, WPARAM(0), LPARAM(0));
-                info!("  show: PostMessageW result: {:?}", result);
+                trace!("show: PostMessageW result: {:?}", result);
             }
         } else {
-            info!("  show: view is None!");
+            warn!("show: 候选栏视图尚未初始化");
         }
     }
 
@@ -216,10 +215,7 @@ impl CandidateWindow {
 
     pub fn update(&self, ctx: &Context) {
         if let Some(view) = self.view.borrow().as_ref() {
-            info!(
-                "  update: hwnd={:?}, posting WM_UPDATE_CANDIDATE",
-                view.hwnd.0
-            );
+            trace!("update: hwnd={:?}, posting WM_UPDATE_CANDIDATE", view.hwnd.0);
             unsafe {
                 let ctx_ptr = Box::into_raw(Box::new(ctx.clone()));
                 let result = PostMessageW(
@@ -228,14 +224,14 @@ impl CandidateWindow {
                     WPARAM(ctx_ptr as usize),
                     LPARAM(0),
                 );
-                info!("  update: PostMessageW result: {:?}", result);
+                trace!("update: PostMessageW result: {:?}", result);
                 if result.is_err() {
                     let _ = Box::from_raw(ctx_ptr);
-                    info!("  update: PostMessageW failed, freed memory");
+                    warn!("update: WM_UPDATE_CANDIDATE 投递失败，已释放上下文内存");
                 }
             }
         } else {
-            info!("  update: view is None!");
+            warn!("update: 候选栏视图尚未初始化");
         }
     }
 

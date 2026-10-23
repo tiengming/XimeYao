@@ -9,3 +9,6 @@ license.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 interprocess = "2.4"
+# 只为 PeekNamedPipe / 管道断开错误码：读响应要先问「到了多少字节」，
+# 否则阻塞 read 会把调用线程（TSF 的宿主 UI 线程）挂死。
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }

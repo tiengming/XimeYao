@@ -1,6 +1,6 @@
-use librime::{get_key_modifiers, vk_to_xk, K_ALT_MASK, K_CONTROL_MASK, K_SHIFT_MASK};
+use librime::{get_key_modifiers, K_ALT_MASK, K_CONTROL_MASK, K_SHIFT_MASK};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
@@ -96,9 +96,13 @@ impl IpcClientHandle {
     }
 
     pub fn is_connected(&self) -> bool {
+        // 出过一次错（超时 / 管道断）之后 `IpcClient` 会自己作废，这里一并反映出来：
+        // 下一次按键就会走重连，而不是先白丢一个键。
         match self.state.try_lock() {
-            Ok(g) => g.client.is_some(),
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().client.is_some(),
+            Ok(g) => g.client.as_ref().is_some_and(|client| client.is_usable()),
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                e.into_inner().client.as_ref().is_some_and(|c| c.is_usable())
+            }
             Err(std::sync::TryLockError::WouldBlock) => false,
         }
     }
@@ -224,7 +228,7 @@ impl IpcClientHandle {
                 session_id,
                 data: IpcRequestData::Position(Position { x, y }),
             };
-            let _ = client.send_oneway(&request);
+            let _ = client.send_no_reply(&request);
         }
     }
 
@@ -469,7 +473,10 @@ struct XimeEditSession {
     thread_mgr: Option<ITfThreadMgr>,
     composition: Arc<std::sync::Mutex<Option<ITfComposition>>>,
     composition_sink: ITfCompositionSink,
-    ipc: IpcClientHandle,
+    /// 编辑会话里量到的插入点坐标。**不在会话里发 IPC**：TSF 编辑会话期间拿着
+    /// 文档写锁，同步等另一个进程（最坏 1 秒）会把宿主（Office / 浏览器）一起拖住。
+    /// 会话结束后由调用方取走再发。
+    position: Arc<std::sync::Mutex<Option<(i32, i32)>>>,
 }
 
 #[implement(ITfCompositionSink)]
@@ -561,7 +568,9 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
 }
 
 impl XimeEditSession_Impl {
-    fn update_caret_position_in_session(context: &ITfContext, ec: u32, ipc: &IpcClientHandle) {
+    /// 在编辑会话里量插入点坐标（`GetTextExt` 需要有效的 `ec`，只能在会话内做），
+    /// 但**不在会话里发 IPC**——同步等待另一个进程期间，文档写锁一直握在我们手里。
+    fn caret_position_in_session(context: &ITfContext, ec: u32) -> Option<(i32, i32)> {
         use std::mem::ManuallyDrop;
         use std::ops::Deref;
 
@@ -572,7 +581,7 @@ impl XimeEditSession_Impl {
                 .GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut selection_len)
                 .is_ok()
             {
-                if let Some(sel_range) = selection[0].range.deref() {
+                let position = if let Some(sel_range) = selection[0].range.deref() {
                     if let Ok(view) = context.GetActiveView() {
                         let mut rc = RECT::default();
                         let mut clipped = BOOL::default();
@@ -581,15 +590,24 @@ impl XimeEditSession_Impl {
                             .is_ok()
                         {
                             debug!(
-                                "update_caret_position_in_session: left={}, bottom={}",
+                                "caret_position_in_session: left={}, bottom={}",
                                 rc.left, rc.bottom
                             );
-                            let _ = ipc.update_position(rc.left, rc.bottom);
+                            Some((rc.left, rc.bottom))
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
                 let [TF_SELECTION { range, .. }] = selection;
                 ManuallyDrop::into_inner(range);
+                position
+            } else {
+                None
             }
         }
     }
@@ -649,10 +667,13 @@ impl XimeEditSession_Impl {
                             // Weasel: collapse to end, set selection with TF_AE_NONE
                             comp_range.Collapse(ec, TF_ANCHOR_END).ok();
                             use std::mem::ManuallyDrop;
-                            let mut sel = TF_SELECTION::default();
-                            sel.range = ManuallyDrop::new(Some(comp_range));
-                            sel.style.ase = TF_AE_NONE;
-                            sel.style.fInterimChar = FALSE;
+                            let sel = TF_SELECTION {
+                                range: ManuallyDrop::new(Some(comp_range)),
+                                style: TF_SELECTIONSTYLE {
+                                    ase: TF_AE_NONE,
+                                    fInterimChar: FALSE,
+                                },
+                            };
                             context.SetSelection(ec, &[sel]).ok();
 
                             match self.composition.try_lock() {
@@ -666,7 +687,15 @@ impl XimeEditSession_Impl {
                                 }
                             }
 
-                            Self::update_caret_position_in_session(context, ec, &self.ipc);
+                            if let Some(position) =
+                                Self::caret_position_in_session(context, ec)
+                            {
+                                // 只记下来，IPC 由 schedule_edit_session 在会话外发。
+                                match self.position.lock() {
+                                    Ok(mut slot) => *slot = Some(position),
+                                    Err(poisoned) => *poisoned.into_inner() = Some(position),
+                                }
+                            }
                         }
                         Err(e) => {
                             debug!("start_composition: SetText failed: {:?}", e);
@@ -699,10 +728,13 @@ impl XimeEditSession_Impl {
                             // Weasel: collapse to end, set selection with TF_AE_NONE
                             range.Collapse(ec, TF_ANCHOR_END).ok();
                             use std::mem::ManuallyDrop;
-                            let mut sel = TF_SELECTION::default();
-                            sel.range = ManuallyDrop::new(Some(range));
-                            sel.style.ase = TF_AE_NONE;
-                            sel.style.fInterimChar = FALSE;
+                            let sel = TF_SELECTION {
+                                range: ManuallyDrop::new(Some(range)),
+                                style: TF_SELECTIONSTYLE {
+                                    ase: TF_AE_NONE,
+                                    fInterimChar: FALSE,
+                                },
+                            };
                             context.SetSelection(ec, &[sel]).ok();
                         }
                         Err(e) => debug!("update_composition_text: SetText failed: {:?}", e),
@@ -852,7 +884,7 @@ impl XimeTextService_Impl {
         );
 
         if self.ipc.is_connected() {
-            let _ = self.ipc.update_position(rect.left, rect.bottom);
+            self.ipc.update_position(rect.left, rect.bottom);
             debug!("update_caret_position_sync: sent to server");
         }
     }
@@ -867,12 +899,13 @@ impl XimeTextService_Impl {
         };
         let composition_sink: ITfCompositionSink = composition_sink_impl.into();
 
+        let position = Arc::new(std::sync::Mutex::new(None));
         let session = XimeEditSession {
             output,
             thread_mgr: mgr,
             composition: self.composition.clone(),
             composition_sink,
-            ipc: self.ipc.clone(),
+            position: position.clone(),
         };
         let session_itf: ITfEditSession = session.into();
         debug!(
@@ -889,6 +922,24 @@ impl XimeTextService_Impl {
                 "schedule_edit_session: RequestEditSession result: {:?}",
                 result
             );
+        }
+
+        // 会话结束后再发插入点。会话内发 IPC 会让文档写锁跟着一起等另一个进程。
+        // 会话被排到异步执行时这里取不到坐标——下一位按键的
+        // `update_caret_position_sync` 会在会话外补一个更新的位置，不会错位。
+        self.send_pending_position(&position);
+    }
+
+    /// 把编辑会话量到的插入点发给 server（没量到就不发）。
+    fn send_pending_position(&self, position: &Arc<std::sync::Mutex<Option<(i32, i32)>>>) {
+        let pending = match position.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some((x, y)) = pending {
+            if self.ipc.is_connected() {
+                self.ipc.update_position(x, y);
+            }
         }
     }
 
@@ -908,6 +959,11 @@ impl XimeTextService_Impl {
         let code = vk.0;
         debug!("process_key_event: vk={} is_up={}", code, is_up);
 
+        // 服务进程自身的实例不处理任何按键（见 `self_host` 字段注释）。
+        if self.self_host.get() {
+            return false;
+        }
+
         if code == VK_SHIFT.0 || code == VK_CONTROL.0 || code == VK_MENU.0 {
             return false;
         }
@@ -917,6 +973,9 @@ impl XimeTextService_Impl {
             .ascii_mode
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            // 这条早退原来一声不响：用户报「只有英文字母」时，日志里看不出是英文态
+            // 还是 TIP 根本没被调用。现在入口有 `process_key_event` 一行、这里有原因。
+            debug!("  -> ascii mode, key passed through to the app");
             return false;
         }
 
@@ -1213,6 +1272,14 @@ pub struct XimeTextService {
     /// 应对应用的怪异调用序列（多次 TestKeyDown、只调 KeyDown 不调 Test）。
     test_keydown_pending: std::cell::Cell<bool>,
     test_keyup_pending: std::cell::Cell<bool>,
+    /// 宿主就是输入法自己的服务进程（`winxime-server.exe`）。
+    ///
+    /// 服务进程为了注册 TSF profile 会碰 `ITfInputProcessorProfileMgr`，一碰 TSF 就
+    /// 成了宿主，系统会把我们的 TIP 也加载进**服务自己**。那个实例连回自己发
+    /// `StartSession`/`FocusIn`/`FocusOut`，而 `FocusOut` 会 `clear_composition()` +
+    /// `window.hide()`——于是用户正在打的字被「自己」清掉、候选栏闪没、托盘图标反复
+    /// 显示隐藏（日志里 `Client connected!` 风暴就是这么来的）。这类实例必须什么都不做。
+    self_host: std::cell::Cell<bool>,
 }
 
 pub const GUID_LANG_BAR_ITEM: GUID = GUID_LBI_INPUTMODE;
@@ -1220,8 +1287,10 @@ pub const GUID_LANG_BAR_ITEM: GUID = GUID_LBI_INPUTMODE;
 /// Shift 移位字符 keysym（美式布局；ASCII 可见字符的 keysym == ASCII 码）。
 /// X11 语义：Shift+可打印键上报移位后的字符（Shift+/ → '?'），librime 的
 /// punctuator/key_binder 按 '?'、'(' 等字符 keysym 登记，中文态打标点
-/// （？、（、！等）依赖此转换。上游 librime::vk_to_xk 暂无 shift 参数，
-/// 移位映射暂驻宿主侧；字母键不参与（基键小写，移位语义由 SHIFT 修饰位承载）。
+/// （？、（、！等）依赖此转换。
+/// **字母也要转**：rime 的 speller 按 keysym 字符入缓冲，不会因为 modifier 里有
+/// Shift 就自动大写；不转的话 Shift+V 进缓冲是 "v"，依赖大写触发器的方案功能
+/// （`calculator: trigger: V`、`^N...` 农历、`^R...` 数字转换）全部失效。
 fn vk_to_xk_shifted(vk: u16) -> Option<i32> {
     let shifted = match vk {
         VK_OEM_1 => 0x3A,          // ; → :
@@ -1245,6 +1314,11 @@ fn vk_to_xk_shifted(vk: u16) -> Option<i32> {
         0x37 => 0x26,              // 7 → &
         0x38 => 0x2A,              // 8 → *
         0x39 => 0x28,              // 9 → (
+        // 字母也必须报**大写 keysym**：rime 的 speller 是"按 keysym 字符"入缓冲，
+        // 不会因为 modifier 里有 Shift 就把小写变大写。之前这里返回 None（保持小写），
+        // 于是 Shift+V 进缓冲的是 "v"——依赖大写触发器的功能（`calculator: trigger: V`、
+        // `^N[0-9...]` 农历、`^R...` 数字转换、`^U...` unicode）全部失效。
+        0x41..=0x5A => 0x41 + (vk - 0x41) as i32, // 'A'..='Z' → 'A'..='Z'
         _ => return None,
     };
     Some(shifted)
@@ -1260,7 +1334,36 @@ fn vk_to_xk_with_shift(vk: u16, shift: bool) -> i32 {
     librime::vk_to_xk(vk)
 }
 
+/// 当前进程（= 宿主应用）的可执行文件名，只给日志用。
+///
+/// 入参传 `None` 拿的是**主模块**路径，也就是宿主 exe（Word、记事本、浏览器……），
+/// 不是我们的 DLL——这正是排查「TIP 有没有被这个程序加载」要的东西。
+fn host_exe_name() -> String {
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
+    if len == 0 {
+        return "unknown".to_string();
+    }
+    let full = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+    full.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(full.as_str())
+        .to_string()
+}
+
+impl Default for XimeTextService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl XimeTextService {
+    /// TSF 对象与套间线程绑定：`composition` / `lang_bar_sink_ref` 用 `Arc`
+    /// 只是为了让同一个套间里的多个 COM 接口实现共享所有权，从不跨线程发送。
+    /// 所以即便 `ITfLangBarItemSink` 不是 `Send`，这里也不需要它。
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         let ipc = IpcClientHandle::empty();
         debug!(
@@ -1289,6 +1392,7 @@ impl XimeTextService {
             shift_solo: std::cell::Cell::new(false),
             test_keydown_pending: std::cell::Cell::new(false),
             test_keyup_pending: std::cell::Cell::new(false),
+            self_host: std::cell::Cell::new(false),
         }
     }
 
@@ -1326,11 +1430,25 @@ impl XimeTextService {
 
 impl XimeTextService_Impl {
     fn activate_impl(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
-        xime_config::init_logging("tsf");
-        debug!("Activate called, tid={}", tid);
+        // 只初始化一次：重复初始化会丢掉旧的 appender guard，最坏在宿主 UI 线程
+        // 上阻塞约 1.1 秒（见 dll::init_logging_once 的注释）。
+        crate::dll::init_logging_once();
+        // 宿主进程名：用户报「打字只有英文字母」时，先确认 TIP 到底有没有被这个程序
+        // 加载——没加载就不会调 OnKeyDown，按键自然一个都到不了 server。
+        let host = host_exe_name();
+        info!("Activate: host={} tid={}", host, tid);
 
         *self.thread_mgr.borrow_mut() = ptim.cloned();
         self.client_id.set(tid);
+
+        // 服务进程自己也会被加载 TIP（它注册 profile 时碰了 TSF）。这个实例绝不能
+        // 连自己：它的 FocusOut 会把用户正在打的组合清掉、候选栏闪没，还会反复
+        // Show/Hide 托盘图标。（详见 `self_host` 字段的注释。）
+        if host.eq_ignore_ascii_case("winxime-server.exe") {
+            self.self_host.set(true);
+            info!("  -> 本进程是输入法服务自身：跳过 IPC / 按键 / 托盘处理");
+            return Ok(());
+        }
 
         match self.ensure_ipc() {
             Ok(()) => {
@@ -1555,6 +1673,12 @@ impl ITfActiveLanguageProfileNotifySink_Impl for XimeTextService_Impl {
         if factivated.as_bool() {
             debug!("  -> Our TIP is being activated!");
 
+            // 服务进程自身的实例：不连 IPC（否则 FocusOut 会清掉用户正在打的字）。
+            if self.self_host.get() {
+                debug!("  -> self host (server process), skipping IPC");
+                return Ok(());
+            }
+
             if !self.ipc.is_connected() {
                 debug!("  -> IPC not connected, attempting reconnect...");
                 if self.ipc.connect().is_err() {
@@ -1627,6 +1751,12 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
             self.processing_focus.get()
         );
 
+        // 服务进程自身的实例：焦点事件一律不理（它会 reconnect 回自己、再发 FocusOut）。
+        if self.self_host.get() {
+            debug!("  -> self host (server process), ignoring focus event");
+            return Ok(());
+        }
+
         // Re-entrancy guard: prevent focus event nesting from STA message pumping
         if self.processing_focus.get() {
             debug!("  -> re-entrant: skipping");
@@ -1692,5 +1822,31 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
 
     fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shift+字母必须报**大写** keysym：rime 按 keysym 字符入缓冲，不看 modifier。
+    ///
+    /// 这是「`calculator: trigger: V` 之类的功能全部失效」的根因——之前 Shift+V
+    /// 进缓冲的是 "v"。
+    #[test]
+    fn shift_letters_report_uppercase_keysym() {
+        assert_eq!(vk_to_xk_with_shift(0x41, true), 0x41); // Shift+A → 'A'
+        assert_eq!(vk_to_xk_with_shift(0x56, true), 0x56); // Shift+V → 'V'
+        assert_eq!(vk_to_xk_with_shift(0x5A, true), 0x5A); // Shift+Z → 'Z'
+        // 不按 Shift 时仍然是小写 keysym（正常拼音输入）
+        assert_eq!(vk_to_xk_with_shift(0x56, false), 0x76); // v
+    }
+
+    /// 符号/数字的移位映射保持不变（标点功能依赖它）。
+    #[test]
+    fn shift_symbols_unchanged() {
+        assert_eq!(vk_to_xk_with_shift(0x31, true), 0x21); // 1 → !
+        assert_eq!(vk_to_xk_with_shift(0xBF, true), 0x3F); // / → ?
+        assert_eq!(vk_to_xk_with_shift(0x30, true), 0x29); // 0 → )
     }
 }

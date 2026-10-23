@@ -53,8 +53,8 @@ fn guid_eq(a: &GUID, b: &GUID) -> bool {
 }
 
 impl ITfLangBarItem_Impl for LangBarItemButton_Impl {
-    fn GetInfo(&self, pInfo: *mut TF_LANGBARITEMINFO) -> Result<()> {
-        let info = unsafe { &mut *pInfo };
+    fn GetInfo(&self, info_ptr: *mut TF_LANGBARITEMINFO) -> Result<()> {
+        let info = unsafe { &mut *info_ptr };
         info.clsidService = crate::class_factory::CLSID_XIME;
         info.guidItem = self.guid;
         info.dwStyle = TF_LBI_STYLE_BTN_BUTTON;
@@ -72,8 +72,8 @@ impl ITfLangBarItem_Impl for LangBarItemButton_Impl {
         Ok(self.status.get())
     }
 
-    fn Show(&self, fShow: BOOL) -> Result<()> {
-        if fShow.as_bool() {
+    fn Show(&self, show: BOOL) -> Result<()> {
+        if show.as_bool() {
             self.status.set(self.status.get() & !TF_LBI_STATUS_HIDDEN);
         } else {
             self.status.set(self.status.get() | TF_LBI_STATUS_HIDDEN);
@@ -101,7 +101,7 @@ impl LangBarItemButton_Impl {
 }
 
 impl ITfLangBarItemButton_Impl for LangBarItemButton_Impl {
-    fn OnClick(&self, click: TfLBIClick, _pt: &POINT, _prcArea: *const RECT) -> Result<()> {
+    fn OnClick(&self, click: TfLBIClick, _pt: &POINT, _area: *const RECT) -> Result<()> {
         debug!("LangBarItem: OnClick, click={}", click.0);
 
         if click == TF_LBI_CLK_RIGHT {
@@ -122,11 +122,11 @@ impl ITfLangBarItemButton_Impl for LangBarItemButton_Impl {
         Ok(())
     }
 
-    fn InitMenu(&self, _pMenu: Ref<'_, ITfMenu>) -> Result<()> {
+    fn InitMenu(&self, _menu: Ref<'_, ITfMenu>) -> Result<()> {
         Ok(())
     }
 
-    fn OnMenuSelect(&self, _wID: u32) -> Result<()> {
+    fn OnMenuSelect(&self, _id: u32) -> Result<()> {
         Ok(())
     }
 
@@ -173,8 +173,8 @@ impl ITfSource_Impl for LangBarItemButton_Impl {
         Ok(LANGBAR_ITEM_COOKIE)
     }
 
-    fn UnadviseSink(&self, dwCookie: u32) -> Result<()> {
-        if dwCookie != LANGBAR_ITEM_COOKIE {
+    fn UnadviseSink(&self, cookie: u32) -> Result<()> {
+        if cookie != LANGBAR_ITEM_COOKIE {
             return Err(Error::from(HRESULT(0x80040200u32 as i32)));
         }
         match self.sink_ref.try_lock() {

@@ -117,7 +117,7 @@ fn remove_install_dir() -> Result<()> {
                 "rmdir",
                 "/s",
                 "/q",
-                &install_dir.to_string_lossy().to_string(),
+                install_dir.to_string_lossy().as_ref(),
             ])
             .spawn();
 
@@ -169,12 +169,11 @@ fn register_dll(dll_path: &str) -> Result<()> {
         let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(std::iter::once(0)).collect();
         let hmodule = LoadLibraryW(PCWSTR::from_raw(dll_path_wide.as_ptr()))?;
 
-        let proc = GetProcAddress(hmodule, s!("DllRegisterServer"));
-        if proc.is_none() {
+        let Some(proc) = GetProcAddress(hmodule, s!("DllRegisterServer")) else {
             return Err(Error::from(E_FAIL));
-        }
+        };
 
-        let func: extern "system" fn() -> HRESULT = std::mem::transmute(proc.unwrap());
+        let func: extern "system" fn() -> HRESULT = std::mem::transmute(proc);
         let result = func();
         if result.is_err() {
             return Err(Error::from(result));
@@ -188,12 +187,11 @@ fn unregister_dll(dll_path: &str) -> Result<()> {
         let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(std::iter::once(0)).collect();
         let hmodule = LoadLibraryW(PCWSTR::from_raw(dll_path_wide.as_ptr()))?;
 
-        let proc = GetProcAddress(hmodule, s!("DllUnregisterServer"));
-        if proc.is_none() {
+        let Some(proc) = GetProcAddress(hmodule, s!("DllUnregisterServer")) else {
             return Err(Error::from(E_FAIL));
-        }
+        };
 
-        let func: extern "system" fn() -> HRESULT = std::mem::transmute(proc.unwrap());
+        let func: extern "system" fn() -> HRESULT = std::mem::transmute(proc);
         let result = func();
         if result.is_err() {
             return Err(Error::from(result));
@@ -314,13 +312,36 @@ fn stop() {
     }
 }
 
+/// 取第 `n` 个命令行参数（去掉外层引号）；缺失时打印用途并退出。
+///
+/// 这个程序是 MSI/脚本调用的控制台工具，参数缺失属于用法错误，
+/// 直接给出提示 + 非零退出码，比 panic 打印栈对安装日志更友好。
+fn arg_at(n: usize, what: &str) -> String {
+    match env::args().nth(n) {
+        Some(value) => value.trim_matches('"').to_string(),
+        None => {
+            println!("缺少{what}参数");
+            process::exit(1);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
 
-        let exe_path = env::current_exe().expect("无法获取exe路径");
-        let exe_dir = exe_path.parent().expect("无法获取exe目录");
+        let exe_path = match env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                println!("无法获取 exe 路径: {e}");
+                process::exit(1);
+            }
+        };
+        let Some(exe_dir) = exe_path.parent() else {
+            println!("无法获取 exe 目录");
+            process::exit(1);
+        };
 
         if env::args().len() == 1 {
             println!("Usage:");
@@ -355,18 +376,12 @@ fn main() -> Result<()> {
             process::exit(1);
         }
 
-        let arg1 = env::args().nth(1).expect("缺少参数");
+        let arg1 = arg_at(1, "缺少参数");
 
         match arg1.as_str() {
             "-register" => {
-                let dll_path = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 DLL 路径参数");
-                let icon_path = env::args()
-                    .nth(3)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 Icon 路径参数");
+                let dll_path = arg_at(2, "缺少 DLL 路径参数");
+                let icon_path = arg_at(3, "缺少 Icon 路径参数");
 
                 println!("Step 1: Registering DLL to HKLM...");
                 println!("  DLL path: {}", dll_path);
@@ -395,10 +410,7 @@ fn main() -> Result<()> {
                 println!("HKLM registration complete!");
             }
             "-copy-to-system" => {
-                let src_dll = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少源 DLL 路径参数");
+                let src_dll = arg_at(2, "缺少源 DLL 路径参数");
 
                 println!("Copying DLL to System32...");
                 println!("  Source: {}", src_dll);
@@ -414,14 +426,8 @@ fn main() -> Result<()> {
                 println!("Copy complete!");
             }
             "-copy-and-register" => {
-                let src_dll = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少源 DLL 路径参数");
-                let icon_path = env::args()
-                    .nth(3)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 Icon 路径参数");
+                let src_dll = arg_at(2, "缺少源 DLL 路径参数");
+                let icon_path = arg_at(3, "缺少 Icon 路径参数");
 
                 println!("Step 1: Copying DLL to System32...");
                 println!("  Source: {}", src_dll);
@@ -464,10 +470,7 @@ fn main() -> Result<()> {
                 println!("Copy-and-register complete!");
             }
             "-unregister" => {
-                let dll_path = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 DLL 路径参数");
+                let dll_path = arg_at(2, "缺少 DLL 路径参数");
 
                 println!("Step 1: Stopping server...");
                 stop();
@@ -620,14 +623,8 @@ fn main() -> Result<()> {
                 }
             }
             "-register-user" => {
-                let dll_path = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 DLL 路径参数");
-                let icon_path = env::args()
-                    .nth(3)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 Icon 路径参数");
+                let dll_path = arg_at(2, "缺少 DLL 路径参数");
+                let icon_path = arg_at(3, "缺少 Icon 路径参数");
 
                 println!("Step 1: Registering DLL from user directory...");
                 println!("  DLL path: {}", dll_path);
@@ -656,10 +653,7 @@ fn main() -> Result<()> {
                 println!("User-level registration complete!");
             }
             "-unregister-user" => {
-                let dll_path = env::args()
-                    .nth(2)
-                    .map(|p| p.trim_matches('"').to_string())
-                    .expect("缺少 DLL 路径参数");
+                let dll_path = arg_at(2, "缺少 DLL 路径参数");
 
                 println!("Step 1: Stopping server...");
                 stop();
@@ -796,7 +790,7 @@ fn main() -> Result<()> {
                 println!("Unregistration complete!");
             }
             "-r" => {
-                let icon_path = env::args().nth(2).expect("缺少 IconPath");
+                let icon_path = arg_at(2, "缺少 IconPath");
                 println!("Registering profile with icon: {}", icon_path);
                 match register(icon_path) {
                     Ok(_) => println!("Registration successful"),

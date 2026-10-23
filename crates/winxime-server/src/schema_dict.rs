@@ -70,7 +70,7 @@ pub(crate) fn parse_code_table_text(text: &str) -> CodeTable {
         }
         // 等价于 Android 版「先按 \t 切、再按两空格切、再按单空格切并丢掉空串」。
         let mut columns = trimmed
-            .split(|c: char| c == ' ' || c == '\t')
+            .split([' ', '\t'])
             .filter(|column| !column.is_empty());
         let Some(word) = columns.next() else { continue };
         let Some(code) = columns.next() else { continue };

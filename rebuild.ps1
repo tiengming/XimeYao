@@ -54,6 +54,28 @@ if (-not $isAdmin) {
 # cargo 与 msix-bundle.ps1 都按仓库根目录解析相对路径；提权重启后 cwd 是 System32，统一锚定。
 Set-Location -LiteralPath $PSScriptRoot
 
+# libquickjs-ng-sys 的 build.rs 在非 Android 平台硬编码 `cc.compiler("clang")`：
+# clang.exe 必须在 PATH 上，否则 release 构建在 quickjs 这一步直接失败
+# （`failed to find tool "clang"`）。`.cargo/config.toml` 里的 LIBCLANG_PATH 只解决
+# bindgen 找 libclang.dll，不能让 cc 找到编译器——两件事，别混。
+$llvmBin = $env:LIBCLANG_PATH
+if ([string]::IsNullOrEmpty($llvmBin)) { $llvmBin = "C:\Program Files\LLVM\bin" }
+if ((Test-Path (Join-Path $llvmBin "clang.exe")) -and -not (($env:PATH -split ';') -contains $llvmBin)) {
+    $env:PATH = "$llvmBin;$env:PATH"
+    Write-Host "LLVM added to PATH: $llvmBin" -ForegroundColor DarkGray
+} elseif (-not (Get-Command clang.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "WARNING: clang.exe not found (libquickjs-ng-sys needs it to build quickjs)." -ForegroundColor Yellow
+}
+
+# librime 只从 `librime/plugins/<name>` 发现插件（上游 action-install-plugins-windows.bat
+# 的落点也是这里）。我们用目录联接指向仓库外的 clone，避免改动 librime 源码。
+# 缺了不会编译失败，但 rime.dll 里就没有 lua 组件——依赖 lua 的方案会缺功能，所以先提示。
+$luaPlugin = Join-Path $PSScriptRoot "..\libximecore\librime\plugins\lua"
+if (-not (Test-Path (Join-Path $luaPlugin "CMakeLists.txt"))) {
+    Write-Host "WARNING: librime-lua 插件未就绪（$luaPlugin 不存在）" -ForegroundColor Yellow
+    Write-Host "  rime.dll 将不含 lua 组件；依赖 lua 的方案（注释格式/农历/计算器等）会缺功能。" -ForegroundColor Yellow
+}
+
 $packageDir = "$PSScriptRoot\target\msix-pkg"
 
 Write-Host "Step 0: Clearing old logs..." -ForegroundColor Yellow

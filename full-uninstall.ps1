@@ -51,6 +51,15 @@ if (Test-Path $userDataDir) {
 }
 
 Write-Host ""
+Write-Host "Step 4b: Removing notification shortcut..." -ForegroundColor Yellow
+# 通知用的开始菜单快捷方式（带 AppUserModel.ID，第一次发系统通知时由 server 创建）。
+# 不删的话开始菜单会留一条指向已删除程序的链接。
+$notifyLink = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\曦码·曜.lnk"
+if (Test-Path -LiteralPath $notifyLink) {
+    Remove-Item -LiteralPath $notifyLink -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ""
 Write-Host "Step 5: Cleaning registry..." -ForegroundColor Yellow
 Start-Process -Verb RunAs -Wait -FilePath "reg.exe" -ArgumentList "delete", "HKCR\CLSID\{5C1E4D8A-F3B2-4A7E-9CD1-2A3B4C5D6E7F}", "/f" -ErrorAction SilentlyContinue
 Start-Process -Verb RunAs -Wait -FilePath "reg.exe" -ArgumentList "delete", "HKLM\SOFTWARE\Microsoft\CTF\TIP\{5C1E4D8A-F3B2-4A7E-9CD1-2A3B4C5D6E7F}", "/f" -ErrorAction SilentlyContinue
@@ -77,6 +86,9 @@ if (Test-Path $installDir) {
 }
 if (Test-Path $userDataDir) {
     $errors += "User data directory still exists"
+}
+if (Test-Path -LiteralPath $notifyLink) {
+    $errors += "Notification shortcut still exists"
 }
 $clsid = reg query "HKCR\CLSID\{5C1E4D8A-F3B2-4A7E-9CD1-2A3B4C5D6E7F}" 2>$null
 if ($clsid) {

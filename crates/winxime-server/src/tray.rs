@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use windows::Win32::{
@@ -8,8 +9,8 @@ use windows::Win32::{
     },
     UI::{
         Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_STATE, NIF_TIP, NIM_ADD, NIM_DELETE,
-            NIM_MODIFY, NIS_HIDDEN, NOTIFYICONDATAW, NOTIFY_ICON_STATE,
+            Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_STATE, NIF_TIP, NIIF_INFO,
+            NIM_ADD, NIM_DELETE, NIM_MODIFY, NIS_HIDDEN, NOTIFYICONDATAW, NOTIFY_ICON_STATE,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreateIconFromResource, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -72,6 +73,9 @@ pub struct SwitchMenuItem {
 pub type SwitchProvider = Arc<dyn Fn() -> Vec<SwitchMenuItem> + Send + Sync>;
 
 static mut TRAY_HWND: Option<HWND> = None;
+/// 与 `TRAY_HWND` 同一个窗口句柄，给**别的线程**读（气泡通知）。
+/// `static mut` 跨线程读是 UB，这里单独放一个原子量。
+static TRAY_HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static mut TRAY_MENU: Option<HMENU> = None;
 static mut TRAY_ON_ACTION: Option<Arc<dyn Fn(TrayAction) + Send + Sync>> = None;
 static mut TRAY_IS_ASCII: bool = false;
@@ -79,15 +83,65 @@ static mut TRAY_SWITCH_PROVIDER: Option<SwitchProvider> = None;
 /// 最近一次弹出时渲染的开关项（id → 数据）。
 static TRAY_SWITCH_ITEMS: Mutex<Vec<SwitchMenuItem>> = Mutex::new(Vec::new());
 
+/// `NOTIFYICONDATAW` 的公共字段（结构大小 / 窗口 / 图标 id）。
+/// 每个调用点都要填这三样，抽出来省得六处各写一遍。
+fn tray_nid(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ID,
+        ..Default::default()
+    }
+}
+
+/// 写 `szTip`（定长数组，超长截断；传进来的文字需自带结尾 NUL）。
+fn set_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
+    for (slot, unit) in nid.szTip.iter_mut().zip(text.encode_utf16()) {
+        *slot = unit;
+    }
+}
+
+/// 把文本写进 `NOTIFYICONDATAW` 的定长宽字符缓冲（留结尾 NUL，超长截断）。
+fn set_wide(buf: &mut [u16], text: &str) {
+    let cap = buf.len().saturating_sub(1);
+    for (slot, unit) in buf.iter_mut().zip(text.encode_utf16().take(cap)) {
+        *slot = unit;
+    }
+}
+
+/// 托盘气泡通知（`NIF_INFO`）。Win10/11 会把它显示成通知中心的横幅。
+///
+/// 为什么需要它：WinRT toast 要求**进程有 MSIX 包身份**，而 MSI 安装到
+/// `Program Files` 的进程没有包身份（开发时用 `Start-Process` 直接跑 exe 也一样）。
+/// 气泡走的是老 API，只要托盘图标在就能显示，两种安装方式都可用。
+///
+/// 返回是否被系统接受（托盘图标未创建时返回 `false`）。
+pub fn show_balloon(title: &str, body: &str) -> bool {
+    let raw = TRAY_HWND_RAW.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    let mut nid = tray_nid(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    set_wide(&mut nid.szInfoTitle, title);
+    set_wide(&mut nid.szInfo, body);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() }
+}
+
 pub struct TrayIcon;
 
 impl TrayIcon {
-    pub fn new(on_action: Arc<dyn Fn(TrayAction) + Send + Sync>, switch_provider: SwitchProvider) {
+    /// 装上托盘图标：建隐藏窗口 + 弹菜单 + 加图标。
+    /// （返回 `()`，所以不叫 `new`——clippy 的 `new_ret_no_self` 说得对。）
+    pub fn install(on_action: Arc<dyn Fn(TrayAction) + Send + Sync>, switch_provider: SwitchProvider) {
         let hwnd = Self::create_window();
         let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
 
         unsafe {
             TRAY_HWND = Some(hwnd);
+            TRAY_HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
             TRAY_MENU = Some(menu);
             TRAY_ON_ACTION = Some(on_action);
             TRAY_SWITCH_PROVIDER = Some(switch_provider);
@@ -135,19 +189,11 @@ impl TrayIcon {
     fn add_icon(hwnd: HWND) {
         unsafe {
             let hicon = load_icon_from_ico(get_icon_for_mode(false));
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let mut nid = tray_nid(hwnd);
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_TRAY_EVENT;
             nid.hIcon = hicon;
-            let tip: Vec<u16> = "中\0".encode_utf16().collect();
-            for (i, c) in tip.iter().enumerate() {
-                if i < nid.szTip.len() {
-                    nid.szTip[i] = *c;
-                }
-            }
+            set_tip(&mut nid, "中\0");
             let result = Shell_NotifyIconW(NIM_ADD, &nid);
             debug!("Shell_NotifyIconW NIM_ADD result: {:?}", result);
         }
@@ -155,10 +201,7 @@ impl TrayIcon {
 
     fn remove_icon(hwnd: HWND) {
         unsafe {
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let nid = tray_nid(hwnd);
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         }
     }
@@ -215,18 +258,10 @@ impl TrayIcon {
                 let is_ascii = TRAY_IS_ASCII;
                 let hicon = load_icon_from_ico(get_icon_for_mode(is_ascii));
                 let tip_str = if is_ascii { "EN\0" } else { "中\0" };
-                let tip: Vec<u16> = tip_str.encode_utf16().collect();
-                let mut nid = NOTIFYICONDATAW::default();
-                nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                nid.hWnd = hwnd;
-                nid.uID = TRAY_ID;
+                let mut nid = tray_nid(hwnd);
                 nid.uFlags = NIF_ICON | NIF_TIP;
                 nid.hIcon = hicon;
-                for (i, c) in tip.iter().enumerate() {
-                    if i < nid.szTip.len() {
-                        nid.szTip[i] = *c;
-                    }
-                }
+                set_tip(&mut nid, tip_str);
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
             }
         }
@@ -418,18 +453,10 @@ fn do_update_icon(is_ascii: bool) {
         if let Some(hwnd) = TRAY_HWND {
             let hicon = load_icon_from_ico(get_icon_for_mode(is_ascii));
             let tip_str = if is_ascii { "EN\0" } else { "中\0" };
-            let tip: Vec<u16> = tip_str.encode_utf16().collect();
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let mut nid = tray_nid(hwnd);
             nid.uFlags = NIF_ICON | NIF_TIP;
             nid.hIcon = hicon;
-            for (i, c) in tip.iter().enumerate() {
-                if i < nid.szTip.len() {
-                    nid.szTip[i] = *c;
-                }
-            }
+            set_tip(&mut nid, tip_str);
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
@@ -447,10 +474,7 @@ pub fn show_icon() {
 fn do_show_icon() {
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let mut nid = tray_nid(hwnd);
             nid.uFlags = NIF_STATE;
             nid.dwState = NOTIFY_ICON_STATE(0);
             nid.dwStateMask = NIS_HIDDEN;
@@ -471,10 +495,7 @@ pub fn hide_icon() {
 fn do_hide_icon() {
     unsafe {
         if let Some(hwnd) = TRAY_HWND {
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let mut nid = tray_nid(hwnd);
             nid.uFlags = NIF_STATE;
             nid.dwState = NIS_HIDDEN;
             nid.dwStateMask = NIS_HIDDEN;
@@ -484,17 +505,14 @@ fn do_hide_icon() {
 }
 
 /// 清理托盘图标和窗口（消息循环退出后调用）
-pub fn cleanup() {
-    unsafe {
+pub fn cleanup() {    unsafe {
         if let Some(hwnd) = TRAY_HWND {
-            let mut nid = NOTIFYICONDATAW::default();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = TRAY_ID;
+            let nid = tray_nid(hwnd);
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 
             let _ = DestroyWindow(hwnd);
             TRAY_HWND = None;
+            TRAY_HWND_RAW.store(0, Ordering::Release);
         }
         if let Some(menu) = TRAY_MENU {
             let _ = DestroyMenu(menu);
