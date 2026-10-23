@@ -248,6 +248,16 @@
             <ComponentRef Id='binary2'/>
             <ComponentRef Id='tsf_dll'/>
             <ComponentRef Id='rime_dll'/>
+            <!-- 语音运行库：server 导入表直接引用，必须随包安装。
+                 CUDA EP 只在 GPU 包里存在，跟着同一个开关引用，否则 light
+                 会报 ICE21（Component does not belong to any Feature）。 -->
+            <ComponentRef Id='sherpa_dll'/>
+            <ComponentRef Id='sherpa_cxx_dll'/>
+            <ComponentRef Id='onnxruntime_dll'/>
+            <ComponentRef Id='onnxruntime_providers_dll'/>
+            <?if $(var.WithCudaDlls) = 1 ?>
+            <ComponentRef Id='onnxruntime_cuda_dll'/>
+            <?endif?>
             <ComponentRef Id='icon_file'/>
             <ComponentRef Id='RunStartup'/>
             <ComponentRef Id='ApplicationShortcut'/>
