@@ -2956,3 +2956,8 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
     `ci.yml` / `msi-build.ps1` 不再 heat data、candle/light 不再传 `data.wxs`；
     `msix-bundle.ps1` 也不再创建空的 package/data。heat 失败改为显式退出。
   - 增加 `workflow_dispatch`，未开 PR 的 feature 分支也能手动跑完整打包链路。
+- **CI 验证（run 39964368057，2026-10-23）**：Build release / Build MSI / Build MSIX /
+  两个 Upload 步骤全绿。产物抽检（下载 artifact）：
+  - MSI：43 个文件，含 `onnxruntime.dll` / `onnxruntime_providers_shared.dll` /
+    `sherpa-onnx-c-api.dll` / `sherpa-onnx-cxx-api.dll`，无 `data/*.yaml|bin`；
+  - MSIX：48 个文件，含上述 4 个语音 DLL + 21 个 `user-data/` 文件，无 `data/`。
