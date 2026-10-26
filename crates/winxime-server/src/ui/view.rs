@@ -46,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{HSTRING, Interface, PCWSTR};
 
-use super::layout::{calculate_client_rect, calculate_root_rect};
+use super::layout::{calculate_client_rect, calculate_root_rect, candidate_item_at};
 use super::model::{CandidateModel, RootModel};
 use super::paint::{on_paint, on_paint_root, on_paint_with_metrics};
 use super::panel::{
@@ -481,6 +481,30 @@ impl RenderedView {
                     let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
                     let pt_y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / scale;
 
+                    // 候选点击：计算器候选提交对应文本，普通 rime 候选走「选中」
+                    // （保留词频/学习语义）。两条都复用粘贴面板的 F24 自注入通道。
+                    let clicked_candidate = {
+                        let model = this.model.borrow();
+                        let metrics = this.metrics.borrow();
+                        metrics
+                            .as_ref()
+                            .and_then(|m| candidate_item_at(&model, m, pt_x, pt_y))
+                    };
+                    if let Some(index) = clicked_candidate {
+                        if crate::calculator::is_active() {
+                            // 计算器结果/原式：点哪条提交哪条的文本。
+                            if let Some(text) = crate::calculator::candidate_commit_text(index) {
+                                if !crate::paste::request_commit(&text) {
+                                    crate::notify::notify("点击上屏失败，请用空格");
+                                }
+                            }
+                            // 错误提示等不可上屏的候选：吞掉点击。
+                        } else if !crate::paste::request_select(index) {
+                            crate::notify::notify("点击选词失败，请用数字键/空格");
+                        }
+                        return LRESULT(0);
+                    }
+
                     // 面板区域点击：菜单卡片导航 / 返回菜单 / 触发动作 / 剪切板条目复制。
                     let (panel_width, bar_height, panel_height) = panel_metrics(this);
                     if let Some((lx, ly)) =
@@ -696,6 +720,32 @@ impl RenderedView {
                     };
                     let _ = TrackMouseEvent(&mut tme);
 
+                    let scale = Self::get_dpi_for_window(hwnd) / 96.0;
+                    let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
+                    let pt_y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / scale;
+
+                    // 候选悬停：普通 rime 候选与计算器候选都可点，统一给反馈。
+                    // 直接改模型里的 hovered 后重绘。
+                    let candidate_hover = {
+                        let model = this.model.borrow();
+                        let metrics = this.metrics.borrow();
+                        metrics
+                            .as_ref()
+                            .and_then(|m| candidate_item_at(&model, m, pt_x, pt_y))
+                    };
+                    let candidate_hover_changed = {
+                        let mut model = this.model.borrow_mut();
+                        if model.hovered != candidate_hover {
+                            model.hovered = candidate_hover;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if candidate_hover_changed {
+                        Self::relayout_and_repaint(this, hwnd);
+                    }
+
                     // hover 反馈：菜单卡片 / 列表条目行 / 网格格子 / 语音页主按钮
                     // （其它子页无 hover 元素）。
                     let page = this.panel_page.get();
@@ -704,9 +754,6 @@ impl RenderedView {
                         || page.is_grid_page()
                         || page == PanelPage::VoiceInput;
                     if this.panel_visible.get() && hoverable {
-                        let scale = Self::get_dpi_for_window(hwnd) / 96.0;
-                        let pt_x = (lparam.0 & 0xFFFF) as u16 as i16 as f32 / scale;
-                        let pt_y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32 / scale;
                         let (panel_width, bar_height, panel_height) = panel_metrics(this);
                         let hovered_item = match window_to_panel(
                             BLUR_RADIUS,
@@ -742,8 +789,14 @@ impl RenderedView {
                 let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
                 if !this_ptr.is_null() {
                     let this = &*this_ptr;
+                    let candidate_hover_cleared = {
+                        let mut model = this.model.borrow_mut();
+                        model.hovered.take().is_some()
+                    };
                     if this.hovered_item.get().is_some() {
                         this.hovered_item.set(None);
+                    }
+                    if candidate_hover_cleared {
                         Self::relayout_and_repaint(this, hwnd);
                     }
                 }
@@ -769,23 +822,40 @@ impl RenderedView {
                             let metrics = this.metrics.borrow();
                             metrics.as_ref().and_then(|m| m.menu_button)
                         };
+                        // 候选可点（计算器与普通 rime 候选都接）：悬停给手型光标。
+                        let over_candidate = {
+                            let model = this.model.borrow();
+                            let metrics = this.metrics.borrow();
+                            metrics
+                                .as_ref()
+                                .is_some_and(|m| candidate_item_at(&model, m, px, py).is_some())
+                        };
                         let (panel_width, bar_height, panel_height) = panel_metrics(this);
-                        let over_interactive = menu_btn.is_some_and(|rect| {
-                            rect_contains(rect, px - BLUR_RADIUS, py - BLUR_RADIUS)
-                        }) || window_to_panel(
-                            BLUR_RADIUS,
-                            bar_height,
-                            panel_width,
-                            panel_height,
-                            px,
-                            py,
-                        )
-                        .is_some_and(|(lx, ly)| {
-                            let list = this.panel_list.borrow();
-                            let grid = this.panel_grid.borrow();
-                            panel_hit(this.panel_page.get(), panel_width, &list, &grid, lx, ly)
-                            .is_some()
-                        });
+                        let over_interactive = over_candidate
+                            || menu_btn.is_some_and(|rect| {
+                                rect_contains(rect, px - BLUR_RADIUS, py - BLUR_RADIUS)
+                            })
+                            || window_to_panel(
+                                BLUR_RADIUS,
+                                bar_height,
+                                panel_width,
+                                panel_height,
+                                px,
+                                py,
+                            )
+                            .is_some_and(|(lx, ly)| {
+                                let list = this.panel_list.borrow();
+                                let grid = this.panel_grid.borrow();
+                                panel_hit(
+                                    this.panel_page.get(),
+                                    panel_width,
+                                    &list,
+                                    &grid,
+                                    lx,
+                                    ly,
+                                )
+                                .is_some()
+                            });
                         let cursor = if over_interactive {
                             LoadCursorW(None, IDC_HAND)
                         } else {

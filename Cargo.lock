@@ -1529,6 +1529,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fasteval2"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "693f2d239802e51c2b7381927eef77061c64fbef1cf2582ab66ffb326c1b52f8"
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6890,6 +6896,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "bzip2-rs",
+ "fasteval2",
  "flate2",
  "hex",
  "interprocess",

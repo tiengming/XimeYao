@@ -1,4 +1,4 @@
-﻿//! 候选栏/字根提示的布局测量：用 DirectWrite 量取文本尺寸，产出 RenderedMetrics。
+//! 候选栏/字根提示的布局测量：用 DirectWrite 量取文本尺寸，产出 RenderedMetrics。
 
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory1, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -45,21 +45,29 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
             let mut item_widths = Vec::new();
             let mut selkey_widths = Vec::new();
             let mut text_widths = Vec::new();
-            let mut selkey_buf = "?.".encode_utf16().collect::<Vec<_>>();
+            let padding_x = 6.0;
+            let padding_y = 4.0;
 
             for (i, item) in model.items.iter().enumerate() {
-                let selkey = model.selkeys.get(i).copied().unwrap_or('?' as u16);
-                selkey_buf[0] = selkey;
+                // 0 = 不画选字键（内置计算器的候选 label 为空：数字是算式输入），
+                // 宽度按 0 算，文本直接从候选左边开始。
+                let selkey = model.selkeys.get(i).copied().unwrap_or(0);
 
-                let mut selkey_metrics = DWRITE_TEXT_METRICS::default();
                 let mut item_metrics = DWRITE_TEXT_METRICS::default();
                 let mut comment_metrics = DWRITE_TEXT_METRICS::default();
 
-                dwrite
-                    .CreateTextLayout(&selkey_buf, &text_format, f32::MAX, f32::MAX)
-                    .map_err(|e| format!("CreateTextLayout for selkey failed: {:?}", e))?
-                    .GetMetrics(&mut selkey_metrics)
-                    .map_err(|e| format!("GetMetrics for selkey failed: {:?}", e))?;
+                let mut selkey_width = 0.0f32;
+                if selkey != 0 {
+                    let selkey_buf = [selkey, '.' as u16];
+                    let mut selkey_metrics = DWRITE_TEXT_METRICS::default();
+                    dwrite
+                        .CreateTextLayout(&selkey_buf, &text_format, f32::MAX, f32::MAX)
+                        .map_err(|e| format!("CreateTextLayout for selkey failed: {:?}", e))?
+                        .GetMetrics(&mut selkey_metrics)
+                        .map_err(|e| format!("GetMetrics for selkey failed: {:?}", e))?;
+                    selkey_width = selkey_metrics.widthIncludingTrailingWhitespace;
+                    item_height = item_height.max(selkey_metrics.height + 2.0 * padding_y);
+                }
 
                 let item_hstring = HSTRING::from(item);
                 dwrite
@@ -76,9 +84,6 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
                     .GetMetrics(&mut comment_metrics)
                     .map_err(|e| format!("GetMetrics for comment failed: {:?}", e))?;
 
-                let padding_x = 6.0;
-                let padding_y = 4.0;
-                let selkey_width = selkey_metrics.widthIncludingTrailingWhitespace;
                 let text_width = item_metrics.widthIncludingTrailingWhitespace;
                 let comment_width = if comment.is_empty() {
                     0.0
@@ -90,9 +95,7 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
 
                 let item_width = selkey_width + text_width + comment_width + 2.0 * padding_x;
                 item_widths.push(item_width);
-                item_height = item_height
-                    .max(item_metrics.height + 2.0 * padding_y)
-                    .max(selkey_metrics.height + 2.0 * padding_y);
+                item_height = item_height.max(item_metrics.height + 2.0 * padding_y);
             }
 
             let items_len = model.items.len() as f32;
@@ -174,6 +177,44 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
                 menu_button,
             })
         }
+    }
+
+    /// 候选命中测试：窗口客户区 DIP 坐标 → 候选下标。
+    ///
+    /// 必须与 `paint.rs` 的摆放递推**同源**（首项 `MARGIN`，逐项加宽度 +
+    /// `COL_SPACING`，满 `cand_per_row` 换行并加 `ROW_SPACING`，窗口坐标减
+    /// `BLUR_RADIUS`）——「画得出来却点不到」是这类自绘 UI 最典型的 bug。
+    pub(crate) fn candidate_item_at(
+        model: &CandidateModel,
+        metrics: &RenderedMetrics,
+        x: f32,
+        y: f32,
+    ) -> Option<usize> {
+        if model.items.is_empty() {
+            return None;
+        }
+        let cx = x - BLUR_RADIUS;
+        let cy = y - BLUR_RADIUS;
+        if cx < 0.0 || cy < 0.0 || cy >= metrics.bar_height {
+            return None;
+        }
+        let columns = (model.cand_per_row as usize).max(1);
+        let mut item_x = MARGIN;
+        let mut item_y = MARGIN;
+        for (i, _) in model.items.iter().enumerate() {
+            let width = metrics.item_widths.get(i).copied().unwrap_or(0.0);
+            if cx >= item_x && cx < item_x + width && cy >= item_y && cy < item_y + metrics.item_height
+            {
+                return Some(i);
+            }
+            if (i + 1) % columns == 0 {
+                item_x = MARGIN;
+                item_y += metrics.item_height + ROW_SPACING;
+            } else {
+                item_x += width + COL_SPACING;
+            }
+        }
+        None
     }
 
     pub(crate) fn calculate_root_rect(
@@ -273,5 +314,58 @@ mod tests {
         assert!(row_count(usize::MAX, usize::MAX).is_finite());
         assert!(row_count(usize::MAX, 1).is_finite());
         assert_eq!(row_count(3, usize::MAX), 1.0);
+    }
+
+    fn hit_model() -> CandidateModel {
+        CandidateModel {
+            items: vec!["a".into(), "b".into(), "c".into()],
+            cand_per_row: 2,
+            ..CandidateModel::default()
+        }
+    }
+
+    fn hit_metrics() -> RenderedMetrics {
+        RenderedMetrics {
+            width: 200.0,
+            height: 80.0,
+            hw_width: 200.0,
+            hw_height: 80.0,
+            bar_height: 80.0,
+            item_height: 20.0,
+            item_widths: vec![60.0, 70.0, 80.0],
+            selkey_widths: vec![0.0, 0.0, 0.0],
+            text_widths: vec![40.0, 50.0, 60.0],
+            menu_button: None,
+        }
+    }
+
+    /// 两列三行：第 1 项、第 2 项、换行后的第 3 项都能命中。
+    #[test]
+    fn candidate_hit_matches_paint_layout() {
+        let model = hit_model();
+        let metrics = hit_metrics();
+        // 窗口坐标 = 内容坐标 + BLUR_RADIUS。
+        let at = |x: f32, y: f32| candidate_item_at(&model, &metrics, x + BLUR_RADIUS, y + BLUR_RADIUS);
+        assert_eq!(at(MARGIN + 5.0, MARGIN + 5.0), Some(0));
+        assert_eq!(at(MARGIN + 60.0 + COL_SPACING + 5.0, MARGIN + 5.0), Some(1));
+        // 第二行：y = MARGIN + item_height + ROW_SPACING
+        assert_eq!(
+            at(MARGIN + 5.0, MARGIN + 20.0 + ROW_SPACING + 5.0),
+            Some(2)
+        );
+    }
+
+    /// 间距、窗口外、blur 边距里都不能误命中。
+    #[test]
+    fn candidate_hit_rejects_gaps_and_outside() {
+        let model = hit_model();
+        let metrics = hit_metrics();
+        let at = |x: f32, y: f32| candidate_item_at(&model, &metrics, x + BLUR_RADIUS, y + BLUR_RADIUS);
+        // 两项之间的 COL_SPACING 空隙
+        assert_eq!(at(MARGIN + 60.0 + 0.5, MARGIN + 5.0), None);
+        // blur 边距（内容区之外）
+        assert_eq!(candidate_item_at(&model, &metrics, 1.0, 1.0), None);
+        // 候选栏下方（面板区）
+        assert_eq!(at(MARGIN + 5.0, 100.0), None);
     }
 }

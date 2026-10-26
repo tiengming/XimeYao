@@ -1016,14 +1016,38 @@ impl XimeTextService_Impl {
         debug!("  -> response: {:?}", response);
         if let Some(response) = response {
             debug!("  -> success={}", response.success);
+            let output = RimeOutput::from_response(&response);
             if response.success {
-                let output = RimeOutput::from_response(&response);
                 self.set_composing(output.composing);
                 if let Some(ctx) = context {
                     debug!("  -> calling schedule_edit_session");
                     self.schedule_edit_session(ctx, output);
                 }
                 return true;
+            }
+            // 被引擎拒绝的键不归输入法，但引擎可能已经不在组词了（内置计算器退出、
+            // 会话被外部重建……）。宿主这边若还挂着 composition，就是显示与引擎
+            // 脱节：收掉它，键仍然交还应用。key-up 绝不能参与——计算器激活期间
+            // 每个抬起事件都会被 rime 拒绝，收 composition 会把刚画出的算式抹掉。
+            if rejected_key_ends_composition(
+                is_up,
+                response.status.is_some(),
+                output.composing,
+                self.is_composing(),
+            ) {
+                debug!("  -> rejected key: engine not composing, end stale composition");
+                self.set_composing(false);
+                if let Some(ctx) = context {
+                    self.schedule_edit_session(
+                        ctx,
+                        RimeOutput {
+                            commit: None,
+                            preedit: String::new(),
+                            _candidates: Vec::new(),
+                            composing: false,
+                        },
+                    );
+                }
             }
         }
         debug!("  -> returning false");
@@ -1825,6 +1849,25 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
     }
 }
 
+/// 被引擎拒绝的按键（`success = false`）是否应顺带收掉宿主里残留的 composition。
+///
+/// 判据是「显示与引擎失配」，不是「键被拒绝」本身：引擎明确说自己不在组词
+/// （回包带 `status` 且 `composing = false`），而宿主这边还挂着 composition。
+/// 三个门条件缺一不可：
+/// - `is_up`：抬起事件不参与（计算器激活期间每个 key-up 都会被 rime 拒绝，
+///   收 composition 会把刚画出的算式抹掉）；
+/// - `status_present`：无 status 时 `composing` 只是默认 false，不能当证据
+///   （正常组词中被拒的键就属于这种——收掉会让显示与 rime 内部状态脱节）；
+/// - `local_composing`：本来没挂着就没有可收的东西。
+fn rejected_key_ends_composition(
+    is_up: bool,
+    status_present: bool,
+    engine_composing: bool,
+    local_composing: bool,
+) -> bool {
+    !is_up && status_present && !engine_composing && local_composing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1848,5 +1891,31 @@ mod tests {
         assert_eq!(vk_to_xk_with_shift(0x31, true), 0x21); // 1 → !
         assert_eq!(vk_to_xk_with_shift(0xBF, true), 0x3F); // / → ?
         assert_eq!(vk_to_xk_with_shift(0x30, true), 0x29); // 0 → )
+    }
+
+    /// 计算器退出后宿主残留 composition 的对账规则。
+    ///
+    /// 正例：key-down、回包带 status、引擎已不组词、宿主还挂着 → 收掉。
+    #[test]
+    fn rejected_key_ends_stale_composition() {
+        assert!(rejected_key_ends_composition(
+            false, // key-down
+            true,  // 回包带 status
+            false, // 引擎 composing=false
+            true,  // 宿主还挂着
+        ));
+    }
+
+    /// 三个门条件逐一反向：任一不满足都不收。
+    #[test]
+    fn rejected_key_never_ends_composition_in_other_cases() {
+        // key-up：计算器激活期间每个抬起事件都会被 rime 拒绝，收掉会抹掉算式。
+        assert!(!rejected_key_ends_composition(true, true, false, true));
+        // 无 status：composing 只是默认值 false，不能当证据。
+        assert!(!rejected_key_ends_composition(false, false, false, true));
+        // 引擎还在组词（普通输入中被拒的 Ctrl 组合等）：显示与 rime 一致，不能动。
+        assert!(!rejected_key_ends_composition(false, true, true, true));
+        // 宿主本来就没挂着 composition。
+        assert!(!rejected_key_ends_composition(false, true, false, false));
     }
 }

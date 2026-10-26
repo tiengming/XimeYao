@@ -302,6 +302,17 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 .CreateSolidColorBrush(&model.highlight_fg_color, None)
                 .map_err(|e| format!("CreateSolidColorBrush selected_text failed: {:?}", e))?;
 
+            // 鼠标悬停：用主题高亮色的低透明度填充（与「选中」的实心高亮区分开）。
+            let hover_color = D2D1_COLOR_F {
+                r: model.highlight_bg_color.r,
+                g: model.highlight_bg_color.g,
+                b: model.highlight_bg_color.b,
+                a: 0.18,
+            };
+            let hover_brush = view.d2d_context
+                .CreateSolidColorBrush(&hover_color, None)
+                .map_err(|e| format!("CreateSolidColorBrush hover failed: {:?}", e))?;
+
 
             let bg_rounded_rect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
@@ -340,7 +351,8 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
             let padding_y = 4.0;
 
             for (i, item) in model.items.iter().enumerate() {
-                let selkey = model.selkeys.get(i).copied().unwrap_or('?' as u16);
+                // 0 = 不画选字键（内置计算器的候选 label 为空：数字是算式输入）。
+                let selkey = model.selkeys.get(i).copied().unwrap_or(0);
                 let mut selkey_buf = [0u16; 3];
                 selkey_buf[0] = selkey;
                 selkey_buf[1] = '.' as u16;
@@ -398,14 +410,16 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                     view.d2d_context
                         .FillRoundedRectangle(&highlight_rounded_rect, &highlight_brush);
 
-                    view.d2d_context.DrawText(
-                        &selkey_buf[..2],
-                        &text_format,
-                        &selkey_rect,
-                        &selected_text_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        DWRITE_MEASURING_MODE_NATURAL,
-                    );
+                    if selkey != 0 {
+                        view.d2d_context.DrawText(
+                            &selkey_buf[..2],
+                            &text_format,
+                            &selkey_rect,
+                            &selected_text_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
 
                     view.d2d_context.DrawText(
                         &item_hstring,
@@ -427,14 +441,31 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                         );
                     }
                 } else {
-                    view.d2d_context.DrawText(
-                        &selkey_buf[..2],
-                        &text_format,
-                        &selkey_rect,
-                        &selkey_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        DWRITE_MEASURING_MODE_NATURAL,
-                    );
+                    if model.hovered == Some(i) {
+                        let hover_rounded_rect = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: x,
+                                top: y,
+                                right: x + item_width,
+                                bottom: y + metrics.item_height,
+                            },
+                            radiusX: 6.0,
+                            radiusY: 6.0,
+                        };
+                        view.d2d_context
+                            .FillRoundedRectangle(&hover_rounded_rect, &hover_brush);
+                    }
+
+                    if selkey != 0 {
+                        view.d2d_context.DrawText(
+                            &selkey_buf[..2],
+                            &text_format,
+                            &selkey_rect,
+                            &selkey_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
 
                     view.d2d_context.DrawText(
                         &item_hstring,

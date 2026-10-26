@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Version = "",
     [switch]$Sign,
     [switch]$Register,
@@ -180,6 +180,19 @@ if ($Register) {
         Write-Host "Appx registration failed!" -ForegroundColor Red
         exit 1
     }
+
+    # 松散文件注册会给包目录打 Low 完整性标签（WindowsApps 的防篡改语义）；
+    # 而进程会继承**镜像文件**的标签：从该目录直接启动 exe 会变成 Low IL，
+    # 连 %APPDATA% 都写不了（日志/注册表/用户词典全部「拒绝访问」）。
+    # 开发布局必须把可执行文件抬回 Medium；真实 MSIX 走 AppModel 激活，
+    # 由系统给 Medium/FullTrust，不受此影响。
+    foreach ($exe in @("winxime-server.exe", "winxime-setup.exe", "winxime-tsf-register.exe")) {
+        $exePath = Join-Path $packageDir $exe
+        if (Test-Path $exePath) {
+            icacls $exePath /setintegritylevel Medium | Out-Null
+        }
+    }
+
     # 注意：-Register 是松散文件注册，注册的包内容直接指向 target\msix-pkg，
     # 不能删除该目录（相当于安装后的 WindowsApps 目录常驻磁盘）。
     Write-Host "Development registration complete! Package layout kept at $packageDir" -ForegroundColor Green

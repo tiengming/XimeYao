@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calculator;
 mod clipboard;
 mod config;
 mod context;
@@ -95,6 +96,8 @@ fn main() {
         shared_data_dir.display(),
         user_data_dir.display()
     );
+    // 内置计算器的「方案是否占用触发键」检测要读当前方案的 yaml（见 calculator.rs）。
+    calculator::init_rime_dir(&user_data_dir);
 
     // 方案部署源：debug 直接用仓库 rime-wubi 源目录；release 用安装目录自带的 data/ + user-data/。
     #[cfg(debug_assertions)]
@@ -488,6 +491,9 @@ fn run_server(
             tray::TrayAction::ToggleAsciiMode => {
                 if let Ok(mut eng) = engine.try_lock() {
                     let current = eng.is_ascii_mode();
+                    // 英文态下宿主不再送按键，计算器必须一起收掉（否则切回中文后
+                    // 会带着旧的算式继续，像「模式没关」）。
+                    crate::calculator::reset("tray ToggleAsciiMode");
                     eng.set_option("ascii_mode", !current);
                     tray::update_tray_icon(!current);
                     window_for_tray.hide();

@@ -2961,3 +2961,302 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
   - MSI：43 个文件，含 `onnxruntime.dll` / `onnxruntime_providers_shared.dll` /
     `sherpa-onnx-c-api.dll` / `sherpa-onnx-cxx-api.dll`，无 `data/*.yaml|bin`；
   - MSIX：48 个文件，含上述 4 个语音 DLL + 21 个 `user-data/` 文件，无 `data/`。
+
+### 2026-10-26 内置计算器 B1（方案无关：`=` 前缀 + 计算缓冲 + 候选栏出结果）
+
+- **背景**：遗留清单第 1 项。方案自带计算器（moqi：`calculator/trigger: V` +
+  `lua/calculator.lua` + `recognizer/patterns/uppercase: "^[A-Z].*$"`）依赖方案自带
+  lua 与 recognizer，换方案/方案没 lua 就失效；目标是「方案无关的保底计算器」，
+  且不抢方案自己的触发方式。
+- **新模块** `crates/winxime-server/src/calculator.rs`（含 9 项单测）：
+  - 触发：组词串为空时按 `=`（`XK_EQUAL`，无 Ctrl/Alt、非 key-up）→ 缓冲置
+    `Some("")`，返回 `preedit="="`、`status.composing=true`。
+  - **composing 必须由 server 补**：宿主 TSF 只看 `status.composing` 决定开/关
+    `ITfComposition`；计算器不经过 rime，`eng.is_composing()` 恒 false，漏了它就是
+    「候选栏有结果、光标处没有算式」。
+  - 缓冲即模式：`Mutex<Option<String>>`，没有独立开关；上屏 / 退格删空前缀 / Esc /
+    任意非算式键都会清空退出（DECISIONS 2026-10-01 红线）。
+  - 按键：数字、`.`、`+ - * / % ^ ( )`、小键盘 `KP_0..9/KP_DECIMAL/ADD/SUB/MUL/DIV`；
+    空格 / 回车 / `=` → 有结果上屏、空算式收掉组词串退出、未成形或有错则保持打开
+    （不丢已输入内容）；退格 / Esc；字母、方向键、Tab、功能键、Ctrl/Alt 组合 →
+    退出并把键交回正常流程（不吞键）。
+  - 求值：`fasteval2` 2.1（`ez_eval`）+ 常量 pi/e、函数 sqrt/abs/ln/log/exp/
+    trig/min/max/pow；三态——没输完不显示候选、除零/语法错显示但不可上屏、
+    可上屏数值；括号未配平按「没输完」；结果 `{:.10}` 去尾零、`-0` 显示 `0`，
+    **显示文本与上屏文本同源**。
+  - 动态让位 `trigger_blocked`（按方案 id 记忆，SelectSchema / ReloadConfig 失效）：
+    当前方案 ① `calculator.trigger` 以 `=` 开头、② `recognizer.patterns` 有 `^=`、
+    ③ `key_binder` 无条件绑定 `equal`、④ `speller.alphabet` 含 `=` → 内置让位，
+    `=` 照常走 rime。moqi（`V` + uppercase）不冲突，两套计算器可共存。
+- **接线**（`ipc_server.rs`）：激活分支在 paste 触发键之后、建议词/英文态之前
+  （联想模式下数字是选字键，不能被抢）；入口分支在英文态早退之后、rime 之前；
+  `get_ipc_status` 开为 `pub(crate)` 供 calculator 复用；
+  复位钩子：`FocusOut` / `EndSession` / `StartSession` / `ToggleAsciiMode` / 托盘切中英 /
+  `ReloadConfig` / `ListDictEntries` / `ImportDictEntry` / 面板上屏触发键（这些路径都会重建/
+  清掉 rime 会话或组词串）。
+- **`main.rs`**：`mod calculator;` + 启动时 `calculator::init_rime_dir(&user_data_dir)`
+  （让位检测读 `<rime>/<id>.schema.yaml`，缺失回退 `build/` 产物）。
+- **模型/绘制**：`CandidateModel` 尊重 IPC `labels`（labels 为空才回退 1–9 + 0，
+  空串 → 0），`layout.rs` / `paint.rs` 遇 `selkey == 0` 不占宽也不画——计算器结果的
+  候选不显示「1.」（数字是往算式里输入用的）。单测：model 2 项 + 原有布局 3 项。
+- **验证**：`cargo build --quiet` 0；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **122 passed / 1 ignored**（winxime-server 119，含
+  calculator 9 项、ui::model 2 项；tsf 2 项）。
+- **环境备注**（与本次改动无关，留给后续会话）：本机 DSH 下 cargo 触发 C 依赖构建时，
+  `cl.exe` 报 `D8050`、`lib.exe` 报 `LNK1104 ... lnk{GUID}.tmp`（TEMP =
+  `D:\Personal\Temp`）；把 `TEMP`/`TMP` 指到工作区内目录（如
+  `target\ctmp`）后正常。仅影响重建第三方 C 库时。
+- **已知边界**：
+  - B1 只做「候选栏出结果 + 空格/回车/`=` 上屏」；**计算器候选点选已接**
+    （见「计算器候选区」条），通用 rime 候选点选见「通用 rime 候选点选」条（已完成）。
+  - ~~退出计算器的键（字母/方向键）交给 rime/应用；若宿主因此没有拿到
+    `success=true` 的回包（如方向键），那条旧组词串要等下一次被处理的按键才消失
+    （TSF 只在 `success=true` 时调度编辑会话，本期不改宿主）。~~
+    → **同日已修**：见下一条「计算器退出后宿主残留旧组词串」。
+  - 中文态直接打 `＝` 需先退出计算器再按（社区 `=` 计算器的共同代价）；方案自己
+    占用 `=` 时内置让位，故不影响方案功能。
+  - 英文态不触发（宿主英文态短路，与既有架构一致）。
+- **待用户验证**（`rebuild.ps1` 后）：内置 wubi86 下 `=` `12+34` 空格 → 上屏 46；
+  `7/2` → 3.5；`1/0` → ⚠ 不能除以 0；Esc / 退格 / 字母退出；moqi 方案里
+  `V` + `1+2` 仍照常、`=` 也能用；切方案后首次按 `=`，server.log 应出现
+  「计算器：触发键 `=` 检测，方案 … —— …」一行。
+
+### 2026-10-26（续）修复：计算器退出后宿主残留旧组词串
+
+- **现象**：计算器激活时按字母 / 方向键 / Ctrl 组合 → 计算器退出、缓冲清空，但宿主里
+  「=1+2」那条组词串还挂着，直到下一次被 rime 处理的按键才被替换；方向键更是一直留着。
+- **根因**：`process_key_event` 只在 `response.success == true` 时调度编辑会话
+  （`winxime-tsf/src/text_input_processor.rs`），而计算器退出走「键不归我 → 交给 rime」；
+  rime 拒绝时回包 `success=false`，宿主既不收 composition、也不吞键，于是留下失配。
+- **修法**（TSF 侧状态对账，不为计算器开特例）：被拒回包里若**带 status 且
+  `composing=false`**、而本地还挂着 composition → 调度一次 `composing=false` 的编辑
+  会话把旧的收掉，键照旧交还应用。判定抽成纯函数
+  `rejected_key_ends_composition(is_up, status_present, engine_composing, local_composing)`。
+- **两个门条件（缺一即坏）**：
+  - `is_up` 不参与：计算器激活期间**每个 key-up** 都会被 rime 拒绝，不排除抬起事件
+    就会在松键时把刚画出的算式抹掉（评估时差点踩中）；
+  - 无 status 不判：`RimeOutput::composing` 在无 status 时是默认 `false`，不能当
+    「引擎不在组词」的证据（正常组词中被拒的 Ctrl 组合就属于这种）。
+- **对普通输入安全**：rime 正在组词时被拒的键，回包 `status.composing=true`，不会命中；
+  只有「引擎确实没组词、宿主还挂着」的失配才命中——计算器退出、服务端重启丢状态
+  等路径都能自愈。
+- **验证**：`cargo build --quiet` 0；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **124 passed / 1 ignored**（winxime-tsf 4 项，新增 2 项门条件
+  单测：正例 + key-up / 无 status / 引擎在组词 / 本地无 composition 四种反例）。
+- **待用户验证**：`rebuild.ps1` 后按 `=` `12+34`，再按方向键或字母 → 算式应立即消失，
+  方向键仍能移动光标、字母仍正常开始组词。
+
+### 2026-10-26 排障：server 起不来（「Server did not start」）——结论已更正
+
+> **更正（同日，见「（续6）Low 完整性标签」）**：真正根因是**工作区目录的 Low 完整性标签**
+> 被 exe 继承，进程变成 Low IL、写不了 `%APPDATA%`；不是终端沙箱。下面保留当时的
+> 证据链与日志降级修复（仍然有效），但「终端沙箱」的归因请以（续6）为准。
+
+- **现象**：`rebuild.ps1` 构建/暂存/MSIX 注册全绿，Step 4 启动 server 失败，无进程、无管道、
+  `server.log` 无任何新行；手动启动时 stderr 里是：
+  `tracing-appender ... failed to create log file: 拒绝访问 (os error 5)`。
+- **当时判断**：ASG/DSH 的右侧终端运行在**文件沙箱（workspace-write）**里——`cargo` 能写
+  `target/`，但 server 需要的 `%APPDATA%\Xime`（日志、`.registry.yaml`、用户词典）
+  和 `%TEMP%\xime` 都在沙箱外，一律 `拒绝访问`。证据链（同一次启动的 stderr）：
+  1. `[logging] 无法在 C:\Users\Admim\AppData\Roaming\xime\logs 创建日志文件：拒绝访问`；
+  2. **回退到 `D:\Personal\Temp\xime\logs` 也拒绝访问**（连临时目录都不让建）；
+  3. `Failed to refresh builtin schema package: 写入注册表失败 ...\.registry.yaml: 拒绝访问`；
+  4. 继续注册 TSF 时，`DllRegisterServer` 里**旧版** `xime_config::init_logging` 又去建
+     日志文件 → panic 跨 `extern` 边界 → `panic in a function that cannot unwind` → abort。
+- **修复**（不只救这一次，也修掉「日志失败拖垮宿主」的结构问题）：
+  - `libximecore/xime-config`：日志初始化从 `rolling::never()`（**panic 版**）改为
+    `Builder::build()` + **降级链**：数据根 logs → `%TEMP%\<name>\logs` → 仅 stderr；
+    失败时 eprintln 带上**主路径、错误、pid/user/APPDATA**。server/setup/tsf 共用，
+    日志是诊断设施，不再能阻止宿主启动。
+  - `rebuild.ps1`：开头加 **APPDATA 可写探针**，在受限终端里直接红字提示并退出；
+    Step 4 改 `-PassThru` 并打印**退出码**（0x…），不再只有一句「Server did not start」。
+  - 全仓 release 重建（14:18），`winxime-server.exe` / `winxime_tsf.dll` /
+    `winxime-setup.exe` / `winxime-tsf-register.exe` 已复制进 `target\msix-pkg`。
+- **规矩（以后照做）**：Agent/DSH 终端只用于**编辑/构建**；`rebuild.ps1` 的「启动 server」
+  与任何需要写 `%APPDATA%` 的步骤，必须在**普通管理员终端或资源管理器**里执行。
+- **验证**：`cargo build --release --quiet` 0；`rebuild.ps1` 语法解析通过。
+- **待用户验证**：从资源管理器双击 `target\msix-pkg\winxime-server.exe`（或在普通管理员
+  PowerShell 里跑 `.\rebuild.ps1`）→ 托盘出现、`%APPDATA%\xime\logs\server.log` 有新行、
+  `\\.\pipe\WinximeNamedPipe` 存在；随后测计算器与边界②的清理。
+
+### 2026-10-26（续）计算器候选区：实时结果 + 原式 + 点选上屏
+
+- **需求**：普通用户不知道「`=` + 算式 + 空格」能出结果。进入计算后候选区要**实时显示
+  算式与结果**，并能选一条上屏。
+- **候选内容**（`build_candidates`）：
+  - 可算时：`[结果(默认高亮), 原式]`；结果与原式相同（裸数字）只留一条，避免重复；
+  - 未成形：`[原式]`，注释「继续输入 · 点击上屏原式」，不画高亮；
+  - 有错：`[错误提示(不可点), 原式]`，错误提示点击不上屏；
+  - label 仍为空（数字是算式输入，不是选字键）。
+- **点选**（初版只接计算器；通用 rime 候选随后补上，见「通用 rime 候选点选」条）：
+  - `layout::candidate_item_at(model, metrics, x, y)` 与 `paint.rs` 摆放递推同源
+    （MARGIN/COL_SPACING/ROW_SPACING/换行，窗口坐标减 BLUR_RADIUS），单测 2 项；
+  - `WM_LBUTTONDOWN` 先判候选区 → `calculator::candidate_commit_text(i)`（与候选同步的
+    上屏文本表，`None` = 仅展示）→ `paste::request_commit`（F24 自注入通道）→
+    `handle_paste_trigger` 里 `calculator::reset` + commit，宿主用提交文本替换组词串。
+- **按键边界**（初版）：数字仍输入算式；空格/回车/`=` 上屏结果；方向键先保持退出
+  （数字键被算式占用，方向键当时留给光标，用户先选的是点选）。方向键选择见下一条。
+- **高亮**：结果候选按输入法主题画选中高亮（`highlight_bg/fg`，来自配置）；原式不高亮。
+- **观感配套**：候选栏锚在进入点（`ANCHOR`），不跟组词串末端每键右滑；已显示时只
+  `update` 不重复 `show`；候选从算式第一个字符起就持续显示，不再因运算符而 hide/show。
+- **验证**：`cargo build --quiet` 0；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **131 passed / 1 ignored**（winxime-server 126，其中
+  calculator 14、ui::layout 5；tsf 4；ipc 1）。
+- **待实机验证**：
+  1. `=` `12+34`：候选区两条（`46` 高亮 / `12+34`），空格上屏 46；
+  2. **点 `46`** 上屏 46、**点 `12+34`** 上屏原式；点错误提示无动作；
+  3. `12+`：候选区只剩原式且不高亮，点击可上屏原式；
+  4. 窗口不再随输入右滑、不再每键闪烁；结果高亮的颜色是否与当前主题协调。
+
+### 2026-10-26（续3）计算器候选「只闪一下」修复 + 方向键按布局选候选
+
+- **「候选只闪一下」的根因**：计算器激活期间的 **key-up** 落到普通按键路径；普通路径在
+  `!eng.is_composing()` 时会 `window.hide()`，于是每个键的抬起都把刚显示的候选栏收掉。
+  修法：激活期间的 `NotAKeyDown`（key-up）直接回一个被拒的应答，不再走 rime 路径
+  （计算器本来就不经过 rime，抬起事件也不需要它处理）。
+- **方向键选候选**（用户选定方案，按布局取轴）：
+  - 横向布局（`style.horizontal = true`）：`←/→` 在「结果 / 原式」间切换；
+  - 纵向布局：`↑/↓` 切换；
+  - **另一根轴仍退出**（把光标移动还给用户）；Esc / 字母 / 退格删空也退出；
+  - 只有 **<2 条可上屏候选**时（裸数字、未成形、错误），方向键照旧退出；
+  - 任何输入/退格把选中重置回「结果」；`highlighted` 跟随选中；
+  - 空格 / 回车 / `=` 上屏**选中项**（结果或原式），高亮与上屏内容一致；
+  - 结果候选的注释带当前切换轴提示（`（←→切换）` / `（↑↓切换）`）；
+  - 点选保留：点哪条上屏哪条（不依赖选中态）。
+- **横向 vs 纵向评估**：两条候选时横向更紧凑、占用垂直空间少；纵向每行一条、更高，
+  可能盖住光标下方文本。实现**跟随用户的 `style.horizontal` 设置**，不强行改写布局；
+  方向键按同一设置取轴，因此两种布局都自洽。
+- **验证**：`cargo build --quiet` 0；`cargo clippy --workspace --all-targets` 0 warning；
+  `cargo test --workspace` = **132 passed / 1 ignored**（winxime-server 127，其中
+  calculator 15：新增选中/轴提示 2 项；ui::layout 5；tsf 4；ipc 1）。
+- **待实机验证**：
+  1. `=` `12+34` → 候选常驻（不再闪），`46` 高亮；
+  2. 横向布局 `←/→`（纵向 `↑/↓`）切换高亮，空格分别上屏 `46` / `12+34`；
+  3. 切换后点击仍未原条上屏；另一根方向键仍退出并移动光标；
+  4. 裸数字/未成形/错误时按方向键 → 退出，不出现「按了没反应」。
+
+### 2026-10-26（续4）计算器候选鼠标悬停反馈
+
+- **行为**：计算器候选上悬停时，该候选铺一层**主题高亮色 18% 透明**的圆角底（与「选中」
+  的实心高亮区分开），光标变**手型**；移出候选或离开窗口即恢复。
+- **实现**：
+  - `CandidateModel.hovered: Option<usize>`（默认 None；普通 rime 候选恒 None）；
+  - `WM_MOUSEMOVE` 用 `layout::candidate_item_at` 命中候选 → 只改 `hovered` 并重绘，
+    不重建候选内容；`WM_MOUSELEAVE` 清除；`WM_SETCURSOR` 命中候选时用 `IDC_HAND`；
+  - `paint.rs` 在**未选中**项上画 hover 底（选中项已有实心高亮，不叠加）。
+- **为什么初版只对计算器**：通用 rime 候选点选当时还没接，给 hover 会暗示「能点」；
+  计算器候选已支持点击上屏，hover 才是真反馈。→ **后续已推广到全部候选**（见下一条）。
+- **验证**：`cargo build --quiet` 0；clippy 0 warning；`cargo test --workspace` =
+  **132 passed / 1 ignored**；release 已暂存（15:08）。
+- **已实机验收**：用户 15:0x 确认悬停浅底 + 手型光标可用（当前 alpha 0.18）。
+  → 见下一条「验收」汇总。
+
+### 2026-10-26 验收（用户口头）：计算器 B1 + 候选交互
+
+- 用户实机验收通过（「暂且验收通过」）：`=` 触发、实时候选（结果 + 原式）、
+  空格/回车/`=` 上屏、鼠标点选、横向 `←/→` / 纵向 `↑/↓` 选择、hover 浅底 + 手型光标、
+  主题高亮。
+- **当前运行环境**：server 由用户从资源管理器/非沙箱终端启动。若从 Agent 沙箱终端启动，
+  会因 `%APPDATA%` 不可写而丢日志/用户词典（见「Agent 终端的文件沙箱」条）。
+- **未提交**（按仓库规矩等用户指示）：
+  - XimeYao：`calculator.rs`（新）+ `ipc_server.rs` / `main.rs` /
+    `ui/{layout,model,paint,view}.rs` / `winxime-tsf/text_input_processor.rs` /
+    `rebuild.ps1` / `Cargo.toml` / `Cargo.lock` / 文档；
+  - libximecore：`crates/xime-config/src/lib.rs`（日志降级，防 panic）。
+  - **注意**：libximecore 是外部仓库，本地靠 `.cargo/config.toml` patch 生效；
+    CI/发布用 git 依赖版本——要让「日志失败不 panic」随发布生效，需要提交/推送
+    libximecore 并在 XimeYao 更新依赖 rev（或同步应用该修复）。
+- **遗留（下一批候选）**：计算器固定横向布局（可选，用户已明确不做——尊重纵横偏好）；
+  B2 自动识别；`＝` 触发取舍；英文态计算；设置页 P0 冻结残余（libximecore）。
+
+### 2026-10-26（续5）通用 rime 候选点选（hover 同步推广）
+
+- **行为**：普通 rime 候选**单击即选中上屏**；hover 浅底 + 手型光标也推广到全部候选
+  （计算器与普通候选同一套几何与反馈）。
+- **通道**：仍走 F24 自注入，但载荷不同——普通候选登记的是**下标**：
+  - `paste.rs`：`PENDING_SELECT` + `request_select(index)` / `take_pending_select()`；
+    与「待上屏文本」**互斥**（登记一种就清另一种，防旧载荷截胡下一次点击），TTL 1.5s；
+  - `ipc_server`：抽出 `select_rime_candidate()`，`IpcCommand::SelectCandidate` 与
+    F24 触发共用；触发键 key-down 先看 select 载荷，再走文本载荷；
+  - `ui/view`：点击候选按 `calculator::is_active()` 分流——计算器提交文本，
+    普通候选走 `request_select(index)`；hover / 手型去掉计算器门控。
+- **为什么不是提交候选文本**：文本提交会绕过 rime，丢掉词频学习与词组/联想语义；
+  下标交给 `eng.select_candidate(index)`，由 rime 产出 commit 再回宿主。
+- **范围**：只点**当前页**（候选栏没有翻页按钮，翻页仍走键盘）；页内下标与 rime
+  当前页一致。
+- **验证**：`cargo build --quiet` 0；clippy 0 warning；`cargo test --workspace` =
+  **133 passed / 1 ignored**（winxime-server 128；paste 新增 1 项载荷互斥/过期；
+  tsf 4；ipc 1）；release 已暂存（15:21）。
+- **待实机**：中文组词时点第 1/2/3 个候选上屏；翻页后点当前页候选；hover/手型；
+  候选已失效时不误上屏；同一候选重复选择后词频是否前移（学习生效）。
+
+### 2026-10-26（续6）验收：通用候选点选 + 根因更正（工作区 Low 完整性标签）
+
+- **日志证据**（17:24，server token `IL=8192` = Medium，日志恢复正常写入）：
+  ```
+  -> selecting candidate at index 3
+  -> select result: true
+  -> commit: Some("策士")
+  -> hide (commit after select)
+  ```
+  → 点击第 4 个候选 → rime 选中成功 → commit「策士」→ 候选栏收起，链路实机通过。
+- **根因更正（推翻「终端沙箱」结论）**：`D:\project\XimeYao` 目录带
+  `Mandatory Label\Low (OI)(CI)(NW)`，**所有从这里编译/复制的 exe 都继承 Low**；
+  从 Low 镜像启动的进程是 **Low IL**——能读 `%APPDATA%`，但**写不了**
+  （日志/`.registry.yaml`/用户词典全部「拒绝访问」）。这解释了为什么换终端、换
+  资源管理器启动都一样失败，也与「终端沙箱」的观感完全一致。
+- **修复**：
+  - 手动把 `target\msix-pkg\{winxime-server,winxime-setup,winxime-tsf-register}.exe`
+    与 `target\release\winxime-server.exe` `icacls /setintegritylevel Medium`；
+  - `msix-bundle.ps1` 在 `Add-AppxPackage -Register` **之后**重新抬 Medium
+    （松散文件注册会再给包目录打 Low）；
+  - 重启后进程 IL=Medium，日志/选择/userdb 写入全部恢复。
+- **仍存在（待用户决定）**：工作区根目录的 Low 标签没动（可能是 DSH/工具的隔离），
+  所以 `cargo run` 直接起的 debug exe 仍是 Low；staged exe 由 `msix-bundle.ps1` 兜底。
+  若希望 `cargo run`/直接双击 release 也正常，需要把 `D:\project\XimeYao`（或至少
+  `target`）的完整性标签抬到 Medium。
+- **结论**：通用 rime 候选点选（含 hover/手型）验收通过；以后排查「写不了 `%APPDATA%`」
+  先看 `icacls` 的 Mandatory Label 与进程 token IL，再怀疑终端/权限。
+
+### 2026-10-26（B2 原型）自动识别：数字开头的影子缓冲（默认关闭）
+
+- **目标**：不用先按 `=`，直接 `12+34` → 候选实时出 `46`；不是算式时数字原样输入。
+- **开关（原型）**：`%APPDATA%\xime\auto_detect.flag` 或环境变量
+  `XIME_CALC_AUTODETECT`；启动时只读一次，改完需重启 server。删掉 flag 即恢复原行为。
+- **状态机**（`calculator.rs`）：
+  - 空组词串 + 数字 → 进入影子缓冲，吞键并显示数字组词串（无候选）；
+  - 数字/小数点/小键盘数字 → 继续累积；
+  - 运算符（含小键盘）→ 切成正式算式（复用 B1 的缓冲/候选/点选）；
+  - `=` → 把已输入数字当完整算式接管（显示结果）；
+  - 退格删到空 / Esc → 退出；
+  - 其它任何键（字母/空格/回车/标点/方向等）→ **回放**：F24 提交数字 +
+    `SendInput` 重新注入当前键（`paste::inject_key`，可打印字符用 `VkKeyScanW`
+    反查 VK/Shift；支持空格/回车/Tab/Esc/方向键）。
+- **失败兜底（不追求优雅，先保证不丢数字）**：
+  - F24 注入失败 → 在当前回包里 `commit` 数字并提示重新按当前键（当前键保不住）；
+  - 数字已提交但当前键注入失败 → 提示重新按键（数字不丢）。
+- **已知边界（原型）**：
+  - `FocusOut`/切窗口会**丢弃**暂存数字（正式版需 commit-on-blur 或超时提交）；
+  - Ctrl/Alt 组合的回放依赖物理修饰键仍按住，属于待验证项；
+  - 数字输入行为被改变（所有裸数字都先进影子缓冲），只建议在 flag 打开时测试。
+- **验证**：`cargo build --quiet` 0；clippy 0 warning；`cargo test --workspace` =
+  **134 passed / 1 ignored**（server 129，新增 `shadow_keys_classified` 1 项）；
+  release 已暂存并抬回 Medium，flag 已创建。
+- **待实机矩阵**：
+  1. `12` → 看到数字组词串、无候选；
+  2. `12+3` → 候选 `15` + 原式，空格上屏 15；
+  3. `12` 空格 → 上屏 `12` + 空格；`12` 回车 → `12` + 换行；
+  4. `12a` → 数字 `12` 上屏后 `a` 正常组词/落字（不丢、不重、不乱序）；
+  5. `12,` → `12` + 逗号；`12` 后 Ctrl+C → 先 `12` 再复制；
+  6. `12` = → 直接进入计算器显示 `12` 的结果；
+  7. `12` Esc → 放弃；`12` 退格 → `1`，再退格退出。
+- **2026-10-26 17:49–17:50 实机验证通过**（日志）：
+  `12+` 触发 `识别为算式 12+` 共 4 次（主键盘/小键盘都有）；
+  `12`+空格/回车/逗号/Ctrl+C 的 2 字回放均成功；`12` 退格/退出正常。
+- **验证中发现并修复**：小键盘数字原先不能作为影子起点（入口只认 `0x30..=0x39`），
+  已加 `is_shadow_starter()`（KP_0..KP_9 也算），并补单测；这也是上一轮「`12+3`
+  似乎失败」的真实原因。
+- **测试开关已删除**：`%APPDATA%\xime\auto_detect.flag` 已移除；当前运行的 server
+  仍是启动时读到的「开」，**重启 server 后恢复默认关闭**。
+- **结论**：B2 原型 **go**（关键路径不丢键、算子接管正常）；但转正必须解决失焦/超时
+  提交、修饰键回放，并以**默认关闭**作为正式形态。
