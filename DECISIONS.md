@@ -1225,5 +1225,35 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
   3. 开关进 `xime.yaml`（默认 false），设置页后续再接；
   4. 数字输入行为改变必须在文档/设置里说清楚，默认不打扰普通用户。
   以上任一不满足则不转正，保留 `=` 模式。
+
+## 2026-10-26 B2 转正：默认关，失焦提交走旧 context，空闲 2.5s 兜底
+
+- **默认关闭**：`calculator.auto_detect` 默认 false。自动识别会改变所有裸数字的输入
+  行为，只能由用户显式开启；开关读原始 `xime.custom.yaml`，不扩展 `xime-config`
+  的 typed struct（XimeYao CI 用 upstream，字段不一致会编译失败）。
+- **失焦必须由宿主提交**：server 无法在失焦后往旧窗口写文字（F24 会去新焦点）。
+  所以 `FocusOut` 改成同步请求，server 把影子数字放进回包；TSF 用
+  `pdimprevfocus.GetTop()` 在**旧 context** 上排编辑会话提交。`XimeEditSession`
+  因此必须能指定 `target_context`，不能无条件 `thread_mgr.GetFocus()`。
+- **顺序**：先同步取回 commit、再排编辑会话；排上就不 `abort_composition`（旧组词串
+  由提交会话收尾），排不上才 abort。反过来会先把带数字的组词串收掉，数字就丢了。
+- **空闲 2.5s 兜底**：只覆盖「打完数字既不按键也不切窗口」；用 F24 自动上屏。这是
+  取舍：打字慢的人在数字中间停超过 2.5s 会被拆开（之后按运算符不再进计算器）。
+  真正的退出仍优先靠非算式键回放 / 失焦提交。
+- **注册责任**：server 跑 Medium，不能写 HKLM；TSF 的 DLL 复制/注册由
+  `rebuild.ps1` Step 3b 以管理员显式执行，`winxime-tsf-register.exe` 抬到 High。
+- **风险**：旧 context 可能已断开，`RequestEditSession` 失败时数字会丢（日志留痕）；
+  失焦同步 IPC 最坏等 1 个 QUICK_TIMEOUT；空闲计时与用户按键的边界可能拆开一组数字。
+  这些在默认关闭的前提下可接受，后续可换「宿主协议级 flush」。
+- **失焦 flush 必须幂等**：TSF 在 `OnSetFocus` 之前就会 `OnCompositionTerminated`，
+  且组词串文本通常**原样留在文档**。这时再插一遍 commit 就是两份数字（实机已复现）。
+  因此：
+  - `OnSetFocus` 只在 composition 仍存在时排 flush；
+  - flush 会话在 `DoEditSession` 里发现 composition 已终止时跳过提交；
+  - server 仍然取走影子缓冲（幂等由宿主侧保证，server 不重复返回同一串）。
+  代价是「终止时文本被宿主清掉」的极端情况会丢数字——日志可辨，默认关闭可控。
+  以后要彻底严谨，应在旧 context 里读回组词串文本再决定是否提交。
+- **验收（2026-10-26 18:14）**：失焦后只剩一份 `12`（TSF `flush skipped`），空闲
+  2.5s 一份，`12+` 正常接管；默认关闭的正式形态通过。
 - **命中与绘制同源**：hover 命中复用 `layout::candidate_item_at`，与点击、绘制共用
   同一套几何；不会出现「高亮了一个格子、点到的却是另一个」。

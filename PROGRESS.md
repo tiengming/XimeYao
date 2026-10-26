@@ -3260,3 +3260,51 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
   仍是启动时读到的「开」，**重启 server 后恢复默认关闭**。
 - **结论**：B2 原型 **go**（关键路径不丢键、算子接管正常）；但转正必须解决失焦/超时
   提交、修饰键回放，并以**默认关闭**作为正式形态。
+
+### 2026-10-26（B2 转正）默认关 + 失焦旧 context 提交 + 空闲兜底
+
+- **正式开关**：`xime.custom.yaml` 的 `calculator.auto_detect: true`，**默认关闭**。
+  读原始 YAML（不进 `xime-config` typed struct），避免 XimeYao CI 依赖 upstream 时
+  因多字段编译失败；开发期仍可用环境变量/flag 打开。
+- **失焦提交（宿主配合）**：
+  - server `FocusOut` 改为同步响应：先 `take_shadow_for_flush()` 取走影子数字，放进
+    回包 `context.commit`，再清 rime/计算器状态；
+  - TSF `OnSetFocus(pdimfocus=null)` 同步请求 `FocusOut`，用 `pdimprevfocus.GetTop()`
+    拿到**旧 context**，在它上面排编辑会话提交数字；排不上才 `abort_composition`；
+  - `XimeEditSession` 增加 `target_context`，编辑会话不再只认 `thread_mgr.GetFocus()`
+    （失焦时焦点已经切到新窗口）。
+- **空闲兜底**：影子缓冲 2.5s 无变化 → 后台线程用 F24 把数字自动上屏；失败则放回
+  影子缓冲，等下一次按键/失焦。每次内容变化用 `SHADOW_GEN` 作废旧计时线程。
+- **注册**：server 以 Medium 运行、写不了 HKLM；`rebuild.ps1` 新增 Step 3b，显式
+  `winxime-tsf-register -copy-and-register`。`tsf-register.exe` 的完整性标签在
+  `msix-bundle.ps1` 里抬到 **High**（server/setup 仍是 Medium）。
+- **测试**：`cargo build --quiet` 0；clippy 0；`cargo test --workspace` =
+  **136 passed / 1 ignored**（server 131；新增 `shadow_flush_takes_digits_once`、
+  `auto_detect_config_defaults_off`）。
+- **待实机**（需先以管理员注册新 TSF DLL，并重开测试应用）：
+  1. `12` 后直接点别的窗口 → `12` 应留在原文档（失焦提交）；
+  2. `12` 后停 3 秒不动 → `12` 自动上屏（空闲提交）；
+  3. `12+3` → 候选 `15`；`12a`/`12空格`/`12,` 回放正常；
+  4. 日志：server `自动识别：失焦提交 N 字` / `空闲 2500ms 提交 N 字`，
+     TSF 日志 `flush shadow commit scheduled=true`。
+- **实机问题（18:10）**：失焦后 `12` 变成 `12 12`（两份）。日志顺序是
+  `OnCompositionTerminated` **先于** `OnSetFocus`：TSF 终止组词串时文本已作为普通
+  文本留在文档里，而 flush 会话看到 `has_comp=false`，又新建 composition 提交一遍。
+- **修复**：
+  - `OnSetFocus` 只在 `self.composition` 仍存在时才排 flush；已终止就不排；
+  - `XimeEditSession` 增加 `flush_commit` 标记，`DoEditSession` 发现 flush 会话的
+    composition 已终止时**跳过提交**（文本已经在了）；
+  - server 仍照常取走影子缓冲，避免下一次失焦/按键重复提交。
+- **代价**：如果某个宿主在终止组词串时把文本也清掉，数字会丢（日志留
+  `flush skipped`）；这是目前为了「不重复」选的方向，后续可改为读旧 context 文本判断。
+- **验证**：`cargo test --workspace` = **136 passed / 1 ignored**；clippy 0；release 已暂存。
+- **2026-10-26 18:14 实机通过**：
+  - `12` 后点别的窗口 → 原文档只留**一份** `12`；TSF 日志
+    `flush: composition already terminated, skip commit`（组词串文本已由 TSF 留在文档，
+    flush 会话按幂等规则跳过）；
+  - `12` 停 3 秒 → `自动识别：空闲 2500ms 提交 2 字`，一份；
+  - `12+` → `识别为算式 12+`，候选/空格上屏正常；
+  - `12a`/`12空格`/`12,` 回放正常。
+- **测试开关已删除**；正式形态默认关闭，开启方式：
+  `xime.custom.yaml` 加 `calculator:\n  auto_detect: true`。当前运行的 server 仍是启动时
+  读到的「开」，**重启后恢复默认关**。

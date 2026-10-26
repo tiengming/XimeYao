@@ -277,13 +277,13 @@ impl IpcClientHandle {
         }
     }
 
-    pub fn focus_out(&self) {
+    pub fn focus_out(&self) -> Option<IpcResponse> {
         debug!("IPC::focus_out() called");
         let mut guard = match self.state.try_lock() {
             Ok(g) => g,
             Err(_) => {
                 debug!("  -> lock failed, skipping focus_out");
-                return;
+                return None;
             }
         };
         let session_id = guard.session_id;
@@ -294,13 +294,19 @@ impl IpcClientHandle {
                 data: IpcRequestData::None,
             };
             debug!("  -> sending FocusOut request (session_id={})", session_id);
-            if client.send_oneway(&request).is_ok() {
-                debug!("  -> FocusOut sent successfully");
-            } else {
-                debug!("  -> FocusOut send FAILED");
+            match client.send_request(&request) {
+                Ok(response) => {
+                    debug!("  -> FocusOut response received");
+                    Some(response)
+                }
+                Err(e) => {
+                    debug!("  -> FocusOut send FAILED: {:?}", e);
+                    None
+                }
             }
         } else {
             debug!("  -> no client, cannot send FocusOut");
+            None
         }
     }
 
@@ -471,6 +477,13 @@ impl RimeOutput {
 struct XimeEditSession {
     output: RimeOutput,
     thread_mgr: Option<ITfThreadMgr>,
+    /// 会话要写哪个 context。正常按键路径传当前 focus；失焦 flush 传
+    /// `pdimprevfocus` 的旧 context——此时 `thread_mgr.GetFocus()` 已经是新窗口。
+    target_context: Option<ITfContext>,
+    /// 失焦 flush 专用：如果排到编辑会话时组词串已经被 TSF 终止（焦点变化时
+    /// `OnCompositionTerminated` 会先跑，且文本通常留在文档里），就不要再插入
+    /// 一遍 commit，否则会出现两份数字。
+    flush_commit: bool,
     composition: Arc<std::sync::Mutex<Option<ITfComposition>>>,
     composition_sink: ITfCompositionSink,
     /// 编辑会话里量到的插入点坐标。**不在会话里发 IPC**：TSF 编辑会话期间拿着
@@ -510,14 +523,19 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
             self.output.preedit
         );
 
-        let doc_mgr = match self.thread_mgr.as_ref() {
-            Some(t) => unsafe { t.GetFocus() }?,
+        let context = match self.target_context.as_ref() {
+            Some(target) => target.clone(),
             None => {
-                debug!("DoEditSession: no thread_mgr");
-                return Ok(());
+                let doc_mgr = match self.thread_mgr.as_ref() {
+                    Some(t) => unsafe { t.GetFocus() }?,
+                    None => {
+                        debug!("DoEditSession: no thread_mgr and no target context");
+                        return Ok(());
+                    }
+                };
+                unsafe { doc_mgr.GetBase() }?
             }
         };
-        let context = unsafe { doc_mgr.GetBase() }?;
         debug!("DoEditSession: got context");
 
         // Handle commit and composition (weasel pattern)
@@ -532,6 +550,12 @@ impl ITfEditSession_Impl for XimeEditSession_Impl {
                 Ok(g) => g.is_some(),
                 Err(_) => false,
             };
+            if self.flush_commit && !has_comp {
+                // 失焦 flush 的组词串已经被 TSF 终止：终止时文本留在文档里，
+                // 这里再插入就是第二份。直接跳过。
+                debug!("DoEditSession: flush skipped (composition already terminated)");
+                return Ok(());
+            }
             if !has_comp {
                 debug!("DoEditSession: creating composition for commit");
                 self.start_composition(&context, ec, "");
@@ -889,8 +913,22 @@ impl XimeTextService_Impl {
         }
     }
 
-    fn schedule_edit_session(&self, context: &ITfContext, output: RimeOutput) {
-        debug!("schedule_edit_session: called");
+    fn schedule_edit_session(&self, context: &ITfContext, output: RimeOutput) -> bool {
+        self.schedule_edit_session_impl(context, output, false)
+    }
+
+    /// 失焦 flush：如果组词串在会话执行前已被终止，DoEditSession 会跳过提交。
+    fn schedule_flush_edit_session(&self, context: &ITfContext, output: RimeOutput) -> bool {
+        self.schedule_edit_session_impl(context, output, true)
+    }
+
+    fn schedule_edit_session_impl(
+        &self,
+        context: &ITfContext,
+        output: RimeOutput,
+        flush_commit: bool,
+    ) -> bool {
+        debug!("schedule_edit_session: called (flush={flush_commit})");
         let tid = self.client_id.get();
         let mgr = self.thread_mgr.borrow().clone();
 
@@ -903,6 +941,8 @@ impl XimeTextService_Impl {
         let session = XimeEditSession {
             output,
             thread_mgr: mgr,
+            target_context: Some(context.clone()),
+            flush_commit,
             composition: self.composition.clone(),
             composition_sink,
             position: position.clone(),
@@ -912,7 +952,7 @@ impl XimeTextService_Impl {
             "schedule_edit_session: tid={}, calling RequestEditSession",
             tid
         );
-        unsafe {
+        let ok = unsafe {
             let result = context.RequestEditSession(
                 tid,
                 &session_itf,
@@ -922,12 +962,14 @@ impl XimeTextService_Impl {
                 "schedule_edit_session: RequestEditSession result: {:?}",
                 result
             );
-        }
+            result.is_ok()
+        };
 
         // 会话结束后再发插入点。会话内发 IPC 会让文档写锁跟着一起等另一个进程。
         // 会话被排到异步执行时这里取不到坐标——下一位按键的
         // `update_caret_position_sync` 会在会话外补一个更新的位置，不会错位。
         self.send_pending_position(&position);
+        ok
     }
 
     /// 把编辑会话量到的插入点发给 server（没量到就不发）。
@@ -1767,7 +1809,7 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
     fn OnSetFocus(
         &self,
         pdimfocus: Ref<'_, ITfDocumentMgr>,
-        _pdimprevfocus: Ref<'_, ITfDocumentMgr>,
+        pdimprevfocus: Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
         debug!(
             "ITfThreadMgrEventSink::OnSetFocus (pdimfocus.is_null={}, processing_focus={})",
@@ -1790,10 +1832,51 @@ impl ITfThreadMgrEventSink_Impl for XimeTextService_Impl {
 
         if pdimfocus.is_null() {
             debug!("  -> Focus lost (pdimfocus is null)");
-            if self.ipc.is_connected() {
-                self.ipc.focus_out();
+
+            // B2：失焦前把影子缓冲的数字从 server 取回来，在**旧 context** 上提交。
+            // 注意顺序：先同步请求（响应里带 commit），再排编辑会话；如果排在
+            // `abort_composition()` 之后，旧组词串已经被收掉，数字就丢了。
+            let response = if self.ipc.is_connected() {
+                self.ipc.focus_out()
+            } else {
+                None
+            };
+            let mut commit_scheduled = false;
+            if let Some(response) = response {
+                let output = RimeOutput::from_response(&response);
+                if output.commit.is_some() {
+                    let composition_present = match self.composition.try_lock() {
+                        Ok(guard) => guard.is_some(),
+                        Err(_) => false,
+                    };
+                    if !composition_present {
+                        // 焦点变化时 TSF 往往先 OnCompositionTerminated：组词串里的
+                        // 数字已经作为普通文本留在文档里，再提交就是第二份。
+                        debug!(
+                            "  -> flush: composition already terminated, skip commit"
+                        );
+                    } else if let Some(prev) = pdimprevfocus.as_ref() {
+                        match unsafe { prev.GetTop() } {
+                            Ok(prev_context) => {
+                                commit_scheduled =
+                                    self.schedule_flush_edit_session(&prev_context, output);
+                                debug!(
+                                    "  -> flush shadow commit scheduled={}",
+                                    commit_scheduled
+                                );
+                            }
+                            Err(e) => {
+                                debug!("  -> flush: prevfocus.GetTop failed: {:?}", e);
+                            }
+                        }
+                    } else {
+                        debug!("  -> flush: no previous document manager");
+                    }
+                }
             }
-            self.abort_composition();
+            if !commit_scheduled {
+                self.abort_composition();
+            }
             self.hide_tray_icon_guarded();
             self.processing_focus.set(false);
             return Ok(());

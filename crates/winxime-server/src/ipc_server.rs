@@ -1047,11 +1047,24 @@ fn process_request(
         }
 
         IpcCommand::FocusOut => {
+            // B2：宿主失焦时先把影子缓冲里的数字取出来，放进回包的 commit 里，
+            // 由 TSF 在**旧 context** 上提交（TSF 的 FocusOut 已改为同步请求）。
+            // 计算器 B1 的算式仍按原行为丢弃（未完成算式不该悄悄上屏）。
+            let pending_digits = crate::calculator::take_shadow_for_flush();
             tracing::info!("FocusOut -> hide composition");
             eng.clear_composition();
             crate::calculator::reset("FocusOut");
             window.hide();
-            IpcResponse::ok(request.session_id)
+            let context = pending_digits.map(|digits| winxime_ipc::Context {
+                preedit: winxime_ipc::Text { str: String::new() },
+                commit: Some(digits),
+                candidates: winxime_ipc::CandidateInfo::default(),
+            });
+            IpcResponse {
+                context,
+                status: Some(get_ipc_status(&eng)),
+                ..IpcResponse::ok(request.session_id)
+            }
         }
 
         IpcCommand::ProcessKeyEvent => {

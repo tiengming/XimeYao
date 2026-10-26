@@ -163,6 +163,20 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# server 以 Medium 运行（工作区 Low 标签会连带降 exe，必须抬回来），写不了 HKLM；
+# TSF 的 DLL 复制与注册由 rebuild（管理员）在这里显式完成。tsf-register 的
+# 完整性标签在 msix-bundle 里抬到 High。
+$tsfRegister = Join-Path $packageDir "winxime-tsf-register.exe"
+$tsfDll = Join-Path $packageDir "winxime_tsf.dll"
+$tsfIcon = Join-Path $packageDir "resources\icon.ico"
+if ((Test-Path $tsfRegister) -and (Test-Path $tsfDll) -and (Test-Path $tsfIcon)) {
+    Write-Host "Step 3b: Registering TSF DLL..." -ForegroundColor Yellow
+    & $tsfRegister -copy-and-register $tsfDll $tsfIcon
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "TSF registration failed (exit $LASTEXITCODE); server will retry at startup." -ForegroundColor Red
+    }
+}
+
 Write-Host "Step 4: Starting server from the staged layout..." -ForegroundColor Yellow
 $server = Start-Process -FilePath "$packageDir\winxime-server.exe" -PassThru
 Start-Sleep -Seconds 3

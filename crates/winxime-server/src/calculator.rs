@@ -20,7 +20,7 @@
 //! - 进出都写 info 日志；逐键只 trace。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use winxime_ipc::{CandidateInfo, Context, IpcResponse, Text};
@@ -86,6 +86,13 @@ static SELECTED: Mutex<usize> = Mutex::new(0);
 /// 默认关闭，靠 `%APPDATA%\xime\auto_detect.flag`（或环境变量 `XIME_CALC_AUTODETECT`）
 /// 打开；这是设计验证用开关，验证通过后再纳入正式配置。
 static SHADOW: Mutex<Option<String>> = Mutex::new(None);
+
+/// 影子缓冲的「代」：每次内容/状态变化 +1，旧的空闲提交线程据此放弃。
+static SHADOW_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 影子缓冲空闲多久后自动把数字上屏（毫秒）。只兜底「用户打完数字就不动了、
+/// 也不切窗口」的场景；正常退出靠非算式键回放 / 失焦提交。
+const SHADOW_IDLE_COMMIT_MS: u64 = 2500;
 
 static AUTO_DETECT: OnceLock<bool> = OnceLock::new();
 
@@ -170,6 +177,7 @@ pub fn is_active() -> bool {
 /// 只在真的退出时记日志，避免刷屏。
 pub fn reset(reason: &str) {
     let _ = lock_shadow().take();
+    cancel_shadow_idle_commit();
     *lock_anchor() = None;
     WINDOW_SHOWN.store(false, Ordering::Relaxed);
     lock_committable().clear();
@@ -192,11 +200,37 @@ pub fn auto_detect_enabled() -> bool {
         if std::env::var_os("XIME_CALC_AUTODETECT").is_some() {
             return true;
         }
-        std::env::var_os("APPDATA")
+        if std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .map(|p| p.join("xime").join("auto_detect.flag").exists())
             .unwrap_or(false)
+        {
+            return true;
+        }
+        auto_detect_from_config()
     })
+}
+
+/// 正式开关：`xime.custom.yaml` 的 `calculator.auto_detect: true`，默认关闭。
+///
+/// 直接读原始 YAML（不进 `xime-config` 的 typed struct）：这样 XimeYao 的 CI
+/// 仍可以依赖 upstream 的 `xime-config`，不会因为多一个字段而编译失败。
+fn auto_detect_from_config() -> bool {
+    let Ok(text) = std::fs::read_to_string(xime_config::XimeConfig::config_path()) else {
+        return false;
+    };
+    auto_detect_from_yaml(&text)
+}
+
+fn auto_detect_from_yaml(text: &str) -> bool {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return false;
+    };
+    value
+        .get("calculator")
+        .and_then(|calculator| calculator.get("auto_detect"))
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// 这颗键能不能作为影子缓冲的起点（数字行 + 小键盘数字）。
@@ -576,6 +610,48 @@ fn classify_shadow_key(keysym: i32) -> ShadowAction {
     }
 }
 
+/// 影子缓冲内容变了：作废旧空闲提交线程，并安排一个新的。
+fn schedule_shadow_idle_commit() {
+    let generation = SHADOW_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(SHADOW_IDLE_COMMIT_MS));
+        if SHADOW_GEN.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let digits = lock_shadow().take();
+        let Some(digits) = digits else {
+            return;
+        };
+        let count = digits.chars().count();
+        tracing::info!("自动识别：空闲 {SHADOW_IDLE_COMMIT_MS}ms 提交 {count} 字");
+        if !crate::paste::request_commit(&digits) {
+            let _ = crate::paste::take_pending();
+            // 注入失败：把数字放回影子缓冲，等下一次按键/失焦再处理。
+            let mut shadow = lock_shadow();
+            if shadow.is_none() {
+                *shadow = Some(digits);
+            }
+        }
+    });
+}
+
+/// 取消当前的空闲提交（内容变化/退出时调用）。
+fn cancel_shadow_idle_commit() {
+    SHADOW_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 失焦时取走暂存数字（由宿主在旧 context 上提交）。返回 `None` = 没有影子缓冲。
+pub fn take_shadow_for_flush() -> Option<String> {
+    let digits = lock_shadow().take()?;
+    cancel_shadow_idle_commit();
+    *lock_anchor() = None;
+    WINDOW_SHOWN.store(false, Ordering::Relaxed);
+    *lock_selected() = 0;
+    let count = digits.chars().count();
+    tracing::info!("自动识别：失焦提交 {count} 字");
+    Some(digits)
+}
+
 /// 进入影子缓冲：组词串为空时按下数字（调用方已校验英文态/组词中/联想态）。
 pub fn try_enter_shadow(
     keysym: i32,
@@ -617,6 +693,7 @@ pub fn try_enter_shadow(
     *lock_selected() = 0;
     tracing::info!("自动识别：进入影子缓冲（数字开头）");
     let value = lock_shadow().clone().unwrap_or_default();
+    schedule_shadow_idle_commit();
     Some(shadow_response(&value, session_id, eng, context, window))
 }
 
@@ -649,6 +726,7 @@ pub fn handle_shadow_key(
             }
             let next = value.clone();
             drop(shadow);
+            schedule_shadow_idle_commit();
             ActiveKeyOutcome::Handled(Box::new(shadow_response(
                 &next, session_id, eng, context, window,
             )))
@@ -682,6 +760,7 @@ pub fn handle_shadow_key(
             }
             let next = value.clone();
             drop(shadow);
+            schedule_shadow_idle_commit();
             ActiveKeyOutcome::Handled(Box::new(shadow_response(
                 &next, session_id, eng, context, window,
             )))
@@ -709,6 +788,7 @@ fn handoff_to_calculator(
     context: &std::sync::Arc<SharedInputContext>,
     window: &std::sync::Arc<CandidateWindow>,
 ) -> ActiveKeyOutcome {
+    cancel_shadow_idle_commit();
     {
         let mut buffer = lock_buffer();
         *buffer = Some(expr);
@@ -757,6 +837,7 @@ fn shadow_replay(
     context: &std::sync::Arc<SharedInputContext>,
     window: &std::sync::Arc<CandidateWindow>,
 ) -> ActiveKeyOutcome {
+    cancel_shadow_idle_commit();
     tracing::info!(
         "自动识别：回放 {} 字 + 当前键 keysym=0x{keysym:X} mod={modifiers}",
         digits.chars().count()
@@ -873,6 +954,7 @@ fn close_response(
     window: &std::sync::Arc<CandidateWindow>,
 ) -> IpcResponse {
     let _ = lock_shadow().take();
+    cancel_shadow_idle_commit();
     context.update(|c| {
         c.suggestion_state = None;
         c.is_composing = false;
@@ -1436,6 +1518,30 @@ punctuator:
     fn preedit_prettifies_operators() {
         assert_eq!(display_preedit("12*34/5"), "12×34÷5");
         assert_eq!(display_preedit("1+2-3"), "1+2-3");
+    }
+
+    /// 失焦提交只能取走一次：TSF 在旧 context 上提交后，下一个 FocusOut 不能再拿到
+    /// 同一串数字（否则会重复上屏）。
+    #[test]
+    fn shadow_flush_takes_digits_once() {
+        let _guard = match STATE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *lock_shadow() = Some("12".to_string());
+        assert_eq!(take_shadow_for_flush().as_deref(), Some("12"));
+        assert!(take_shadow_for_flush().is_none());
+        assert!(lock_shadow().is_none());
+    }
+
+    /// 正式开关：只认 `calculator.auto_detect: true`，缺省/类型不对都算关。
+    #[test]
+    fn auto_detect_config_defaults_off() {
+        assert!(!auto_detect_from_yaml(""));
+        assert!(!auto_detect_from_yaml("calculator: {}"));
+        assert!(!auto_detect_from_yaml("calculator:\n  auto_detect: false\n"));
+        assert!(auto_detect_from_yaml("calculator:\n  auto_detect: true\n"));
+        assert!(!auto_detect_from_yaml("calculator:\n  auto_detect: yes-please\n"));
     }
 
     /// B2 影子缓冲的按键分类：数字/小数点累积、运算符接管、其余回放。

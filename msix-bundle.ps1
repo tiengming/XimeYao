@@ -186,11 +186,16 @@ if ($Register) {
     # 连 %APPDATA% 都写不了（日志/注册表/用户词典全部「拒绝访问」）。
     # 开发布局必须把可执行文件抬回 Medium；真实 MSIX 走 AppModel 激活，
     # 由系统给 Medium/FullTrust，不受此影响。
-    foreach ($exe in @("winxime-server.exe", "winxime-setup.exe", "winxime-tsf-register.exe")) {
+    # tsf-register 需要写 HKLM，单独抬到 High（rebuild 以管理员运行它）。
+    foreach ($exe in @("winxime-server.exe", "winxime-setup.exe")) {
         $exePath = Join-Path $packageDir $exe
         if (Test-Path $exePath) {
             icacls $exePath /setintegritylevel Medium | Out-Null
         }
+    }
+    $registerPath = Join-Path $packageDir "winxime-tsf-register.exe"
+    if (Test-Path $registerPath) {
+        icacls $registerPath /setintegritylevel High | Out-Null
     }
 
     # 注意：-Register 是松散文件注册，注册的包内容直接指向 target\msix-pkg，
