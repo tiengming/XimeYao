@@ -82,9 +82,9 @@ static COMMITTABLE: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
 /// 方向键在本布局对应的轴上切换；任何输入/退格都回到结果。
 static SELECTED: Mutex<usize> = Mutex::new(0);
 
-/// B2 原型：数字开头的影子缓冲。`Some("12")` = 已吞下数字、等待运算符。
-/// 默认关闭，靠 `%APPDATA%\xime\auto_detect.flag`（或环境变量 `XIME_CALC_AUTODETECT`）
-/// 打开；这是设计验证用开关，验证通过后再纳入正式配置。
+/// B2 数字开头的影子缓冲。`Some("12")` = 已吞下数字、等待运算符。
+/// 默认开启；`calculator.auto_detect: false` 可关，开发期也可用
+/// `%APPDATA%\xime\auto_detect.flag` / 环境变量强制打开。
 static SHADOW: Mutex<Option<String>> = Mutex::new(None);
 
 /// 影子缓冲的「代」：每次内容/状态变化 +1，旧的空闲提交线程据此放弃。
@@ -211,26 +211,28 @@ pub fn auto_detect_enabled() -> bool {
     })
 }
 
-/// 正式开关：`xime.custom.yaml` 的 `calculator.auto_detect: true`，默认关闭。
+/// 正式开关：`xime.custom.yaml` 的 `calculator.auto_detect`，**默认开启**；
+/// 显式写 `false` 才关闭。
 ///
 /// 直接读原始 YAML（不进 `xime-config` 的 typed struct）：这样 XimeYao 的 CI
 /// 仍可以依赖 upstream 的 `xime-config`，不会因为多一个字段而编译失败。
 fn auto_detect_from_config() -> bool {
-    let Ok(text) = std::fs::read_to_string(xime_config::XimeConfig::config_path()) else {
-        return false;
-    };
-    auto_detect_from_yaml(&text)
+    match std::fs::read_to_string(xime_config::XimeConfig::config_path()) {
+        Ok(text) => auto_detect_from_yaml(&text),
+        // 没有配置文件也按默认开启；显式写 false 才关。
+        Err(_) => true,
+    }
 }
 
 fn auto_detect_from_yaml(text: &str) -> bool {
     let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
-        return false;
+        return true;
     };
     value
         .get("calculator")
         .and_then(|calculator| calculator.get("auto_detect"))
         .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// 这颗键能不能作为影子缓冲的起点（数字行 + 小键盘数字）。
@@ -572,7 +574,7 @@ fn window_origin(anchor: Option<(i32, i32)>, caret: (i32, i32)) -> (i32, i32) {
 }
 
 // ---------------------------------------------------------------------------
-// B2 原型：数字开头的影子缓冲（设计验证用，默认关闭）
+// B2：数字开头的影子缓冲（默认开启，`auto_detect: false` 可关）
 // ---------------------------------------------------------------------------
 
 /// 影子缓冲里的按键分类。
@@ -1534,14 +1536,14 @@ punctuator:
         assert!(lock_shadow().is_none());
     }
 
-    /// 正式开关：只认 `calculator.auto_detect: true`，缺省/类型不对都算关。
+    /// 正式开关：缺省/类型不对都按开启；只有显式 `auto_detect: false` 才关。
     #[test]
-    fn auto_detect_config_defaults_off() {
-        assert!(!auto_detect_from_yaml(""));
-        assert!(!auto_detect_from_yaml("calculator: {}"));
+    fn auto_detect_config_defaults_on() {
+        assert!(auto_detect_from_yaml(""));
+        assert!(auto_detect_from_yaml("calculator: {}"));
         assert!(!auto_detect_from_yaml("calculator:\n  auto_detect: false\n"));
         assert!(auto_detect_from_yaml("calculator:\n  auto_detect: true\n"));
-        assert!(!auto_detect_from_yaml("calculator:\n  auto_detect: yes-please\n"));
+        assert!(auto_detect_from_yaml("calculator:\n  auto_detect: yes-please\n"));
     }
 
     /// B2 影子缓冲的按键分类：数字/小数点累积、运算符接管、其余回放。
