@@ -21,6 +21,7 @@ use windows_numerics::Vector2;
 use super::layout::calculate_client_rect;
 use super::model::{CandidateModel, RenderedMetrics, RootModel};
 use super::panel::{draw_menu_button, draw_panel, PanelGrid, PanelList, VoiceView};
+use super::panel::{MENU_BUTTON_GAP, MENU_BUTTON_SIZE, MENU_STRIP_HEIGHT};
 use super::view::RenderedView;
 use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
 
@@ -345,8 +346,21 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 .map_err(|e| format!("CreateSolidColorBrush comment failed: {:?}", e))?;
 
             let mut col = 0usize;
-            let mut x = MARGIN + blur_radius;
-            let mut y = MARGIN + blur_radius;
+            let start_x = MARGIN
+                + if model.horizontal {
+                    MENU_BUTTON_SIZE + MENU_BUTTON_GAP
+                } else {
+                    0.0
+                }
+                + blur_radius;
+            let mut x = start_x;
+            let mut y = MARGIN
+                + if model.horizontal {
+                    0.0
+                } else {
+                    MENU_STRIP_HEIGHT
+                }
+                + blur_radius;
             let padding_x = 6.0;
             let padding_y = 4.0;
 
@@ -491,7 +505,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 col += 1;
                 if col >= model.cand_per_row as usize {
                     col = 0;
-                    x = MARGIN + blur_radius;
+                    x = start_x;
                     y += metrics.item_height + ROW_SPACING;
                 } else {
                     x += item_width + COL_SPACING;
@@ -514,7 +528,7 @@ use super::{BLUR_RADIUS, COL_SPACING, MARGIN, PanelPaintState, ROW_SPACING};
                 )?;
             }
 
-            // "⋮" 菜单按钮（候选栏最右侧，横向布局）。
+            // "⋮"/"⋯" 菜单按钮（主题色 + 淡色圆角底）。
             if let Some(rect) = metrics.menu_button {
                 draw_menu_button(
                     &view.d2d_context,

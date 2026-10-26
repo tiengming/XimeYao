@@ -33,7 +33,7 @@ pub(crate) struct RenderedMetrics {
     pub(crate) item_widths: Vec<f32>,
     pub(crate) selkey_widths: Vec<f32>,
     pub(crate) text_widths: Vec<f32>,
-    /// "⋮" 菜单按钮矩形（窗口 DIP 坐标，仅横向布局存在）。
+    /// "⋮"/"⋯" 菜单按钮矩形（窗口 DIP 坐标）。
     pub(crate) menu_button: Option<(f32, f32, f32, f32)>,
 }
 
@@ -42,15 +42,12 @@ pub struct CandidateModel {
     pub items: Vec<String>,
     pub comments: Vec<String>,
     pub selkeys: Vec<u16>,
-    /// Rime 的分页信息：候选栏按 `horizontal`/`cand_per_row` 自己排，没有画
-    /// "1/5" 这类页码，所以这两个值目前只写不读。
-    #[allow(dead_code)]
+    /// Rime 的分页信息：候选栏本身不画页码/翻页按钮，翻页走键盘或鼠标滚轮。
     pub total_pages: u32,
-    #[allow(dead_code)]
-    pub current_page: u32,
     pub font_family: HSTRING,
     pub font_size: f32,
     pub cand_per_row: u32,
+    /// 候选排列方向：横向时 ⋮ 在左侧、三个点竖排；纵向时 ⋯ 在顶部、三个点横排。
     pub horizontal: bool,
     pub use_cursor: bool,
     pub current_sel: usize,
@@ -184,7 +181,6 @@ impl From<&Context> for CandidateModel {
             comments,
             selkeys,
             total_pages: ctx.candidates.total_pages,
-            current_page: ctx.candidates.current_page + 1,
             current_sel: ctx.candidates.highlighted,
             hovered: None,
             font_family,

@@ -32,6 +32,8 @@ use crate::speech::SpeechState;
 /// 候选栏右侧 "⋮" 菜单按钮。
 pub(crate) const MENU_BUTTON_SIZE: f32 = 20.0;
 pub(crate) const MENU_BUTTON_GAP: f32 = 4.0;
+/// 纵向候选栏顶部给居中 `⋯` 留的条带高度。
+pub(crate) const MENU_STRIP_HEIGHT: f32 = 16.0;
 /// 面板区高：布局 = 标题栏 36 + 间距 8 + 4 行条目×32（行距 4）+ 间距 8 + 底部区 32 + 底边距 8。
 // 面板高度收紧到内容实际需要：菜单页顶部 10 + 3 行卡片 104 + 间距 8
 // + 品牌栏 32 + 底边距 8 = 162（菜单页无标题栏，子页面内容少、此高度足够）。
@@ -2106,9 +2108,32 @@ pub(crate) fn draw_menu_button(
             true,
         )?;
         let brush = d2d
-            .CreateSolidColorBrush(&model.selkey_color, None)
+            .CreateSolidColorBrush(&model.highlight_bg_color, None)
             .map_err(|e| format!("CreateSolidColorBrush menu_btn failed: {:?}", e))?;
-        let buf: Vec<u16> = "⋮".encode_utf16().collect();
+        // 淡主题色圆角底，让按钮比纯文字更可点（用户要求「出色的 UI」）。
+        let bg = D2D1_COLOR_F {
+            r: model.highlight_bg_color.r,
+            g: model.highlight_bg_color.g,
+            b: model.highlight_bg_color.b,
+            a: 0.14,
+        };
+        let bg_brush = d2d
+            .CreateSolidColorBrush(&bg, None)
+            .map_err(|e| format!("CreateSolidColorBrush menu_bg failed: {:?}", e))?;
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: blur_radius + rect.0,
+                top: blur_radius + rect.1,
+                right: blur_radius + rect.2,
+                bottom: blur_radius + rect.3,
+            },
+            radiusX: 5.0,
+            radiusY: 5.0,
+        };
+        d2d.FillRoundedRectangle(&rounded, &bg_brush);
+        // 横向候选栏 ⋮ 竖排在左侧；纵向候选栏 ⋯ 横排在顶部。
+        let dots = if model.horizontal { "⋮" } else { "⋯" };
+        let buf: Vec<u16> = dots.encode_utf16().collect();
         d2d.DrawText(
             &buf,
             &format,

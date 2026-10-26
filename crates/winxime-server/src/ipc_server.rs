@@ -6,7 +6,7 @@ use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use tracing::info;
 use widestring::u16cstr;
@@ -19,6 +19,59 @@ use xime_rime::RimeEngine;
 
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// 候选栏翻页：UI 线程只做引擎锁 + 前后台切换，**不再走 F24 自注入**。
+/// 翻页不需要宿主跑编辑会话，直接改 server 的 rime 状态和候选窗即可；
+/// 这样连续快速点击也不会把宿主/TSF 的按键队列塞满。
+static PAGE_TX: OnceLock<std::sync::mpsc::Sender<bool>> = OnceLock::new();
+
+/// 在 server 启动时注入候选栏翻页需要的全局句柄，并起一个**单线程**翻页队列。
+/// 连续快速点击只排队、不每次 spawn 线程，也不会把 F24 塞进宿主按键队列。
+pub fn set_page_targets(
+    engine: &Arc<std::sync::Mutex<RimeEngine>>,
+    context: &Arc<SharedInputContext>,
+    window: &Arc<CandidateWindow>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    if PAGE_TX.set(tx).is_err() {
+        return;
+    }
+    let engine = engine.clone();
+    let context = context.clone();
+    let window = window.clone();
+    std::thread::spawn(move || {
+        while let Ok(backward) = rx.recv() {
+            // 引擎可能正被按键线程占着：短暂重试几次，别把这次点击丢掉。
+            let mut eng = None;
+            for _ in 0..40 {
+                match engine.try_lock() {
+                    Ok(guard) => {
+                        eng = Some(guard);
+                        break;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        eng = Some(poisoned.into_inner());
+                        break;
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+            let Some(mut eng) = eng else {
+                continue;
+            };
+            let _ = change_rime_page(&mut eng, &context, &window, 0, backward);
+        }
+    });
+}
+
+/// 候选栏 `‹`/`›` 点击：投递到翻页队列，UI 线程立即返回。
+pub fn request_page_from_ui(backward: bool) {
+    if let Some(tx) = PAGE_TX.get() {
+        let _ = tx.send(backward);
+    }
+}
+
 pub fn run_ipc_server(
     engine: Arc<std::sync::Mutex<RimeEngine>>,
     context: Arc<SharedInputContext>,
@@ -29,6 +82,7 @@ pub fn run_ipc_server(
 ) {
     let pipe_path = get_pipe_path();
     tracing::info!("Winxime Server: creating named pipe at {}", pipe_path);
+    set_page_targets(&engine, &context, &window);
 
     let sd = match SecurityDescriptor::deserialize(u16cstr!("D:(A;;GA;;;WD)")) {
         Ok(sd) => sd,
@@ -1413,25 +1467,7 @@ fn process_request(
                 winxime_ipc::IpcRequestData::ChangePage(b) => *b,
                 _ => false,
             };
-
-            tracing::info!("  -> backward: {}", backward);
-            let changed = eng.change_page(backward);
-            tracing::info!("  -> change result: {}", changed);
-
-            let ipc_ctx = get_ipc_context(&eng, &None);
-            if let Some(ctx) = &ipc_ctx {
-                let pos = context.read(|c| (c.caret_x, c.caret_y));
-                window.show(pos.0, pos.1);
-                window.update(ctx);
-            }
-
-            IpcResponse {
-                success: changed,
-                session_id: request.session_id,
-                context: ipc_ctx,
-                status: Some(get_ipc_status(&eng)),
-                ..IpcResponse::default()
-            }
+            change_rime_page(&mut eng, context, window, request.session_id, backward)
         }
 
         _ => IpcResponse::fail(request.session_id),
@@ -1536,6 +1572,33 @@ fn select_rime_candidate(
 ///   提交文本替换掉当前 composition 并结束它，于是内容经正常的 TSF 编辑会话落到
 ///   光标处（`success: true` 同时让宿主吃掉这个键）。
 /// - key up：照样回 `success: true`（不漏给前台应用），但不带 commit。
+fn change_rime_page(
+    eng: &mut RimeEngine,
+    context: &std::sync::Arc<SharedInputContext>,
+    window: &CandidateWindow,
+    session_id: u32,
+    backward: bool,
+) -> IpcResponse {
+    tracing::info!("  -> backward: {}", backward);
+    let changed = eng.change_page(backward);
+    tracing::info!("  -> change result: {}", changed);
+
+    let ipc_ctx = get_ipc_context(eng, &None);
+    if let Some(ctx) = &ipc_ctx {
+        let pos = context.read(|c| (c.caret_x, c.caret_y));
+        window.show(pos.0, pos.1);
+        window.update(ctx);
+    }
+
+    IpcResponse {
+        success: changed,
+        session_id,
+        context: ipc_ctx,
+        status: Some(get_ipc_status(eng)),
+        ..IpcResponse::default()
+    }
+}
+
 fn handle_paste_trigger(
     eng: &mut RimeEngine,
     context: &std::sync::Arc<SharedInputContext>,

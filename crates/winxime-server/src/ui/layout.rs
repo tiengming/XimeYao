@@ -7,8 +7,17 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows_core::{w, HSTRING};
 
 use super::model::{CandidateModel, RenderedMetrics, RootModel};
-use super::panel::{panel_extra_height, PanelPage, MENU_BUTTON_GAP, MENU_BUTTON_SIZE, PANEL_MIN_WIDTH};
+use super::panel::{panel_extra_height, PanelPage, MENU_BUTTON_GAP, MENU_BUTTON_SIZE, MENU_STRIP_HEIGHT, PANEL_MIN_WIDTH};
 use super::{BLUR_RADIUS, COL_SPACING, MARGIN, MIN_WIDTH, ROW_SPACING};
+
+/// 候选区相对窗口左侧的偏移：横向布局左侧要留 ⋮ 按钮。
+fn candidate_offset(horizontal: bool) -> f32 {
+    if horizontal {
+        MENU_BUTTON_SIZE + MENU_BUTTON_GAP
+    } else {
+        0.0
+    }
+}
 
 /// 候选栏行数。
 ///
@@ -115,51 +124,54 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
             }
 
             let cand_per_row = model.cand_per_row as usize;
-
-            // "⋮" 菜单按钮：仅横向布局，排在最后一个候选所在行的行尾（与 macOS 一致）。
             let cpr = cand_per_row.max(1);
-            let last = model.items.len() - 1;
-            let row_of_last = last / cpr;
-            let mut menu_button = None;
-            if model.horizontal {
-                let col_of_last = last % cpr;
-                let row_end_x = MARGIN
-                    + item_widths[row_of_last * cpr..=last].iter().copied().sum::<f32>()
-                    + col_of_last as f32 * COL_SPACING;
-                let btn_x = row_end_x + MENU_BUTTON_GAP;
-                let btn_y = MARGIN + row_of_last as f32 * (item_height + ROW_SPACING);
-                menu_button = Some((
-                    btn_x,
-                    btn_y,
-                    btn_x + MENU_BUTTON_SIZE,
-                    btn_y + item_height,
-                ));
-            }
+            let rows = row_count(model.items.len(), cand_per_row);
+            let strip = if model.horizontal {
+                0.0
+            } else {
+                MENU_STRIP_HEIGHT
+            };
+            let bar_height = strip + rows * item_height + (rows - 1.0) * ROW_SPACING + 2.0 * MARGIN;
 
+            let offset = candidate_offset(model.horizontal);
             let mut max_row_width = MIN_WIDTH;
-            for (row_index, row_start) in (0..model.items.len()).step_by(cpr).enumerate() {
+            for row_start in (0..model.items.len()).step_by(cpr) {
                 let row_end = std::cmp::min(row_start + cpr, model.items.len());
-                let mut row_width: f32 = item_widths[row_start..row_end].iter().copied().sum::<f32>()
+                let row_width: f32 = item_widths[row_start..row_end].iter().copied().sum::<f32>()
                     + (row_end - row_start - 1) as f32 * COL_SPACING
-                    + 2.0 * MARGIN;
-                if menu_button.is_some() && row_index == row_of_last {
-                    // 菜单按钮占位计入其所在行的行宽。
-                    row_width += MENU_BUTTON_GAP + MENU_BUTTON_SIZE;
-                }
+                    + 2.0 * MARGIN
+                    + offset;
                 max_row_width = max_row_width.max(row_width);
             }
-
-            let rows = row_count(model.items.len(), cand_per_row);
-            let bar_height = rows * item_height + (rows - 1.0) * ROW_SPACING + 2.0 * MARGIN;
-            // 面板仅在横向布局且有候选时展开（与 macOS 一致，竖排无菜单按钮入口）。
-            // 面板高度按页面取（「剪切板」子页比菜单页高）。
-            let panel_height = panel_page.filter(|_| model.horizontal).map(panel_extra_height);
-            let width = if panel_height.is_some() {
-                max_row_width.max(PANEL_MIN_WIDTH)
-            } else {
+            // 横向：左侧 ⋮ 已算进 offset；纵向：顶部条带里居中放 ⋯，不再占右侧宽度。
+            let mut width = if model.horizontal {
                 max_row_width
+            } else {
+                max_row_width.max(MENU_BUTTON_SIZE + 2.0 * MARGIN)
             };
+
+            // 面板横向/纵向都允许展开。
+            let panel_height = panel_page.map(panel_extra_height);
+            if panel_height.is_some() {
+                width = width.max(PANEL_MIN_WIDTH);
+            }
             let height = bar_height + panel_height.unwrap_or(0.0);
+
+            let menu_button = if model.horizontal {
+                Some((
+                    MARGIN,
+                    MARGIN,
+                    MARGIN + MENU_BUTTON_SIZE,
+                    MARGIN + item_height,
+                ))
+            } else {
+                Some((
+                    (width - MENU_BUTTON_SIZE) / 2.0,
+                    MARGIN,
+                    (width + MENU_BUTTON_SIZE) / 2.0,
+                    MARGIN + strip,
+                ))
+            };
 
             let hw_width = ((width + BLUR_RADIUS * 2.0) * scale).ceil();
             let hw_height = ((height + BLUR_RADIUS * 2.0) * scale).ceil();
@@ -199,8 +211,15 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
             return None;
         }
         let columns = (model.cand_per_row as usize).max(1);
-        let mut item_x = MARGIN;
-        let mut item_y = MARGIN;
+        let start_x = MARGIN + candidate_offset(model.horizontal);
+        let start_y = MARGIN
+            + if model.horizontal {
+                0.0
+            } else {
+                MENU_STRIP_HEIGHT
+            };
+        let mut item_x = start_x;
+        let mut item_y = start_y;
         for (i, _) in model.items.iter().enumerate() {
             let width = metrics.item_widths.get(i).copied().unwrap_or(0.0);
             if cx >= item_x && cx < item_x + width && cy >= item_y && cy < item_y + metrics.item_height
@@ -208,7 +227,7 @@ fn row_count(items: usize, cand_per_row: usize) -> f32 {
                 return Some(i);
             }
             if (i + 1) % columns == 0 {
-                item_x = MARGIN;
+                item_x = start_x;
                 item_y += metrics.item_height + ROW_SPACING;
             } else {
                 item_x += width + COL_SPACING;
@@ -344,13 +363,14 @@ mod tests {
     fn candidate_hit_matches_paint_layout() {
         let model = hit_model();
         let metrics = hit_metrics();
-        // 窗口坐标 = 内容坐标 + BLUR_RADIUS。
+        // 窗口坐标 = 内容坐标 + BLUR_RADIUS；纵向布局顶部有 ⋯ 条带。
+        let top = MARGIN + MENU_STRIP_HEIGHT;
         let at = |x: f32, y: f32| candidate_item_at(&model, &metrics, x + BLUR_RADIUS, y + BLUR_RADIUS);
-        assert_eq!(at(MARGIN + 5.0, MARGIN + 5.0), Some(0));
-        assert_eq!(at(MARGIN + 60.0 + COL_SPACING + 5.0, MARGIN + 5.0), Some(1));
-        // 第二行：y = MARGIN + item_height + ROW_SPACING
+        assert_eq!(at(MARGIN + 5.0, top + 5.0), Some(0));
+        assert_eq!(at(MARGIN + 60.0 + COL_SPACING + 5.0, top + 5.0), Some(1));
+        // 第二行：y = top + item_height + ROW_SPACING
         assert_eq!(
-            at(MARGIN + 5.0, MARGIN + 20.0 + ROW_SPACING + 5.0),
+            at(MARGIN + 5.0, top + 20.0 + ROW_SPACING + 5.0),
             Some(2)
         );
     }
@@ -362,7 +382,8 @@ mod tests {
         let metrics = hit_metrics();
         let at = |x: f32, y: f32| candidate_item_at(&model, &metrics, x + BLUR_RADIUS, y + BLUR_RADIUS);
         // 两项之间的 COL_SPACING 空隙
-        assert_eq!(at(MARGIN + 60.0 + 0.5, MARGIN + 5.0), None);
+        let top = MARGIN + MENU_STRIP_HEIGHT;
+        assert_eq!(at(MARGIN + 60.0 + 0.5, top + 5.0), None);
         // blur 边距（内容区之外）
         assert_eq!(candidate_item_at(&model, &metrics, 1.0, 1.0), None);
         // 候选栏下方（面板区）

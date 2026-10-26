@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW,
     IDC_HAND, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA,
-    WINDOWPOS, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETCURSOR,
+    WINDOWPOS, WM_DESTROY, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_SETCURSOR,
     WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -704,6 +704,19 @@ impl RenderedView {
                             let _ = KillTimer(Some(hwnd), VOICE_TIMER_ID);
                             this.voice_timer.set(false);
                         }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let this_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CandidateWindow;
+                if !this_ptr.is_null() {
+                    let this = &*this_ptr;
+                    let total_pages = this.model.borrow().total_pages;
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                    if total_pages > 1 && delta != 0 {
+                        // 候选窗是 NOACTIVATE，滚轮消息不一定到得了这里；能收到就翻页。
+                        crate::ipc_server::request_page_from_ui(delta > 0);
                     }
                 }
                 LRESULT(0)
