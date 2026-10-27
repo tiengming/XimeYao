@@ -139,13 +139,6 @@ foreach ($file in $rimeWubiFiles) {
     Copy-Item $file.FullName $destPath -Force
 }
 
-# 3.5 安装包自带的补充方案（cangjie5 / luna_pinyin / essay.txt）：
-# 这些也是用户升级后仍应算「内置」的方案，和 rime-wubi 一起进入 user-data seed。
-if (Test-Path "builtin-extra") {
-    Write-Host "Step 3.5: Copying builtin-extra seed..." -ForegroundColor Yellow
-    Copy-Item "builtin-extra\*" "$packageDir\user-data" -Recurse -Force
-}
-
 # 4. Copy resources
 Write-Host "Step 4: Copying resources..." -ForegroundColor Yellow
 Copy-Item "resources\*" "$packageDir\resources" -Recurse

@@ -1302,8 +1302,8 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
 - **schema_list 写入**：已有 `patch` 时插入同一 patch，禁止重复顶层 `patch`；否则
   librime 只取第一个 patch，列表丢失→无 build→全部「未启用」。
 
-## 2026-10-27 补充安装包 seed：cangjie5 / luna_pinyin
+## 2026-10-27 上游决定：librime 默认方案不分发
 
-- 用户确认 cangjie5 与 luna_pinyin 是安装包自带、不是手放；原 CI 包的 `data/` 里有它们。
-- 不再恢复整个 `data/`（会带 librime 示例/重复文件）；改为仓库内 `builtin-extra/`（cangjie5 字典+方案、luna_pinyin 字典+方案、essay.txt），构建时复制进 `user-data`。
-- 这样 `seed_builtin_from` 只认安装包 seed，cangjie/luna 仍算内置，`data/` 继续不分发。
+- cangjie5 / luna_pinyin / essay.txt 是 librime 内部默认方案，上游明确要求**完全屏蔽**，不作为内置 seed 分发或注入。
+- 因此 `builtin-extra/` 不进入仓库/安装包；`msix-bundle.ps1` 与 `msi-build.ps1` 只复制 rime-wubi。
+- `data/` 继续不分发；旧用户数据里已有的 cangjie/luna 文件留在本地方案，不主动删除。

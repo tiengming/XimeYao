@@ -135,13 +135,6 @@ foreach ($file in $files) {
     Copy-Item $file.FullName $destPath -Force
 }
 
-# 安装包自带的补充方案（cangjie5 / luna_pinyin / essay.txt）：与 rime-wubi 一起
-# 进入 user-data seed，保证老用户升级后它们仍是「内置方案」而不是本地方案。
-if (Test-Path "builtin-extra") {
-    Write-Host "Step 2.5b: Copying builtin-extra seed..." -ForegroundColor Yellow
-    Copy-Item "builtin-extra\*" "$TargetDir\user-data" -Recurse -Force
-}
-
 # 3. Copy resources
 Write-Host "Step 3: Copying resources..." -ForegroundColor Yellow
 if (Test-Path "$TargetDir\resources") {
