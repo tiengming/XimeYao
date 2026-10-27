@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calculator;
 mod clipboard;
 mod config;
 mod context;
@@ -95,14 +96,16 @@ fn main() {
         shared_data_dir.display(),
         user_data_dir.display()
     );
+    // 内置计算器的「方案是否占用触发键」检测要读当前方案的 yaml（见 calculator.rs）。
+    calculator::init_rime_dir(&user_data_dir);
 
     // 方案部署源：debug 直接用仓库 rime-wubi 源目录；release 用安装目录自带的 data/ + user-data/。
     #[cfg(debug_assertions)]
     let schema_sources = vec![shared_data_dir.clone()];
     #[cfg(not(debug_assertions))]
     let schema_sources = vec![install_dir.join("data"), install_dir.join("user-data")];
-    ensure_rime_data(&schema_sources, &user_data_dir);
-    register_builtin_schema_package(&user_data_dir);
+    ensure_rime_data(&schema_sources, &user_data_dir, builtin_removed(&user_data_dir));
+    register_builtin_schema_package(&user_data_dir, &schema_sources);
 
     if !shared_data_dir.exists() {
         info!("Shared data not found at {:?}", shared_data_dir);
@@ -242,24 +245,51 @@ fn get_data_dirs() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBu
 /// 这是方案隔离的基础：内置方案文件有了明确归属后，市场包安装时的冲突检测才知道
 /// 哪些文件不得覆盖（内容不同即拒绝），卸载时也不会把内置方案文件当成第三方包的
 /// 文件删掉，且随时可从备份还原。
-fn register_builtin_schema_package(rime_dir: &std::path::Path) {
+fn register_builtin_schema_package(
+    rime_dir: &std::path::Path,
+    seed_dirs: &[std::path::PathBuf],
+) {
     let data_root = rime_dir
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| rime_dir.to_path_buf());
     let manifest = SchemaManifest::new(rime_dir.to_path_buf(), data_root);
-    match manifest.refresh_builtin_package() {
-        Ok(0) => info!("Builtin schema package already up to date"),
-        Ok(n) => info!("Registered {} new builtin schema file(s)", n),
-        Err(e) => warn!("Failed to refresh builtin schema package: {}", e),
+    if manifest.is_builtin_removed() {
+        // 用户显式清理过内置方案：不再把 seed 注入回来，只把用户自己的方案
+        // 登记为 local，供设置页展示/删除。
+        let _ = manifest.register_local_package();
+        info!("Builtin schema package was removed by user; seed injection skipped");
+        return;
     }
+    match manifest.seed_builtin_from(seed_dirs) {
+        Ok(0) => info!("Builtin schema package: no new seed files"),
+        Ok(n) => info!("Registered {n} builtin schema file(s) from install seed"),
+        Err(e) => warn!("Failed to seed builtin schema package: {}", e),
+    }
+}
+
+/// 数据根里的「用户清理过内置」标记（设置页写入）。
+fn builtin_removed(rime_dir: &std::path::Path) -> bool {
+    rime_dir
+        .parent()
+        .map(|root| root.join(".builtin-removed").is_file())
+        .unwrap_or(false)
 }
 
 /// 对齐 Xime 的方案部署语义（单目录模型）：
 /// - 首装（rime 目录下无任何 *.schema.yaml）：把 source_dirs 依次全量复制进 rime 目录
 /// - 升级：仅覆盖内容有变化且文件名不含 "custom" 的文件（保护用户定制与第三方方案）
-fn ensure_rime_data(source_dirs: &[std::path::PathBuf], rime_dir: &std::path::Path) {
+fn ensure_rime_data(
+    source_dirs: &[std::path::PathBuf],
+    rime_dir: &std::path::Path,
+    skip_seed: bool,
+) {
     let _ = std::fs::create_dir_all(rime_dir);
+    if skip_seed {
+        // 用户清理过内置方案：不再把安装包 seed 复制回来。
+        info!("Builtin schema seed copy skipped (removed by user)");
+        return;
+    }
     let has_schema = std::fs::read_dir(rime_dir)
         .map(|entries| {
             entries
@@ -488,6 +518,9 @@ fn run_server(
             tray::TrayAction::ToggleAsciiMode => {
                 if let Ok(mut eng) = engine.try_lock() {
                     let current = eng.is_ascii_mode();
+                    // 英文态下宿主不再送按键，计算器必须一起收掉（否则切回中文后
+                    // 会带着旧的算式继续，像「模式没关」）。
+                    crate::calculator::reset("tray ToggleAsciiMode");
                     eng.set_option("ascii_mode", !current);
                     tray::update_tray_icon(!current);
                     window_for_tray.hide();

@@ -6,6 +6,21 @@ use windows_core::HSTRING;
 use crate::config::get_colors;
 use winxime_ipc::Context;
 
+/// 选字键：`labels` 为空 = 服务端没指定（rime 路径），回退 1–9 + 0；
+/// 非空则逐项取首字符，空串映射成 `0`（绘制层约定 0 = 不画选字键）。
+fn selkeys_from_labels(labels: &[winxime_ipc::Text]) -> Vec<u16> {
+    if labels.is_empty() {
+        return ('1'..='9')
+            .map(|c| c as u16)
+            .chain(std::iter::once('0' as u16))
+            .collect();
+    }
+    labels
+        .iter()
+        .map(|label| label.str.chars().next().map(|c| c as u16).unwrap_or(0))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RenderedMetrics {
     pub(crate) width: f32,
@@ -18,7 +33,7 @@ pub(crate) struct RenderedMetrics {
     pub(crate) item_widths: Vec<f32>,
     pub(crate) selkey_widths: Vec<f32>,
     pub(crate) text_widths: Vec<f32>,
-    /// "⋮" 菜单按钮矩形（窗口 DIP 坐标，仅横向布局存在）。
+    /// "⋮"/"⋯" 菜单按钮矩形（窗口 DIP 坐标）。
     pub(crate) menu_button: Option<(f32, f32, f32, f32)>,
 }
 
@@ -27,18 +42,18 @@ pub struct CandidateModel {
     pub items: Vec<String>,
     pub comments: Vec<String>,
     pub selkeys: Vec<u16>,
-    /// Rime 的分页信息：候选栏按 `horizontal`/`cand_per_row` 自己排，没有画
-    /// "1/5" 这类页码，所以这两个值目前只写不读。
-    #[allow(dead_code)]
+    /// Rime 的分页信息：候选栏本身不画页码/翻页按钮，翻页走键盘或鼠标滚轮。
     pub total_pages: u32,
-    #[allow(dead_code)]
-    pub current_page: u32,
     pub font_family: HSTRING,
     pub font_size: f32,
     pub cand_per_row: u32,
+    /// 候选排列方向：横向时 ⋮ 在左侧、三个点竖排；纵向时 ⋯ 在顶部、三个点横排。
     pub horizontal: bool,
     pub use_cursor: bool,
     pub current_sel: usize,
+    /// 鼠标悬停的候选下标（仅计算器候选使用；普通 rime 候选恒 None）。
+    /// WM_MOUSEMOVE 直接改这里并重绘——候选内容不重建，省一次模型更新。
+    pub hovered: Option<usize>,
     /// 候选/面板窗口圆角半径（`style.corner_radius`，DIP）。
     ///
     /// 之前绘制里写死 8.0 / 10.0，设置页的「圆角大小」存了也没人读。
@@ -144,12 +159,11 @@ impl From<&Context> for CandidateModel {
             .map(|c| c.str.clone())
             .collect();
 
-        // 选字键：1–9，第 10 个用 0（librime 的 selector 原生按
-        // `index = ((ch - XK_0) + 9) % 10` 映射，所以 0 就是第 10 个，不用额外绑定）。
-        let selkeys: Vec<u16> = ('1'..='9')
-            .map(|c| c as u16)
-            .chain(std::iter::once('0' as u16))
-            .collect();
+        // 选字键：优先用服务端给的 labels（内置计算器的候选 label 为空串——数字是
+        // 往算式里输入用的，画「1.」会让人误以为按 1 能选中）。labels 为空时回退
+        // rime 的固定 1–9 + 0（librime 的 selector 原生按
+        // `index = ((ch - XK_0) + 9) % 10` 映射，所以 0 就是第 10 个）。
+        let selkeys = selkeys_from_labels(&ctx.candidates.labels);
 
         // 候选栏一次显示几个：`style.candidate_count`（文档语义）。
         // rime 一页最多给 `menu/page_size` 个，所以这里再截断一次——
@@ -167,8 +181,8 @@ impl From<&Context> for CandidateModel {
             comments,
             selkeys,
             total_pages: ctx.candidates.total_pages,
-            current_page: ctx.candidates.current_page + 1,
             current_sel: ctx.candidates.highlighted,
+            hovered: None,
             font_family,
             font_size: config.style.font_size,
             corner_radius: config.style.corner_radius.clamp(0.0, 32.0),
@@ -183,5 +197,38 @@ impl From<&Context> for CandidateModel {
             highlight_bg_color,
             border_color,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selkeys_from_labels;
+    use winxime_ipc::Text;
+
+    fn label(s: &str) -> Text {
+        Text { str: s.to_string() }
+    }
+
+    /// 没有 labels（rime 路径）：保持原来的 1–9 + 0，行为不变。
+    #[test]
+    fn selkeys_fall_back_to_rime_defaults() {
+        let keys = selkeys_from_labels(&[]);
+        assert_eq!(
+            keys,
+            vec![
+                '1' as u16, '2' as u16, '3' as u16, '4' as u16, '5' as u16, '6' as u16,
+                '7' as u16, '8' as u16, '9' as u16, '0' as u16,
+            ]
+        );
+    }
+
+    /// 有 labels（内置计算器）：空串 = 不画（0），非空取首字符。
+    #[test]
+    fn selkeys_follow_server_labels() {
+        let keys = selkeys_from_labels(&[label(""), label(""), label("")]);
+        assert_eq!(keys, vec![0, 0, 0]);
+
+        let keys = selkeys_from_labels(&[label("1"), label(""), label("ab")]);
+        assert_eq!(keys, vec!['1' as u16, 0, 'a' as u16]);
     }
 }

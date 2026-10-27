@@ -6,7 +6,7 @@ use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use tracing::info;
 use widestring::u16cstr;
@@ -19,6 +19,59 @@ use xime_rime::RimeEngine;
 
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// 候选栏翻页：UI 线程只做引擎锁 + 前后台切换，**不再走 F24 自注入**。
+/// 翻页不需要宿主跑编辑会话，直接改 server 的 rime 状态和候选窗即可；
+/// 这样连续快速点击也不会把宿主/TSF 的按键队列塞满。
+static PAGE_TX: OnceLock<std::sync::mpsc::Sender<bool>> = OnceLock::new();
+
+/// 在 server 启动时注入候选栏翻页需要的全局句柄，并起一个**单线程**翻页队列。
+/// 连续快速点击只排队、不每次 spawn 线程，也不会把 F24 塞进宿主按键队列。
+pub fn set_page_targets(
+    engine: &Arc<std::sync::Mutex<RimeEngine>>,
+    context: &Arc<SharedInputContext>,
+    window: &Arc<CandidateWindow>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    if PAGE_TX.set(tx).is_err() {
+        return;
+    }
+    let engine = engine.clone();
+    let context = context.clone();
+    let window = window.clone();
+    std::thread::spawn(move || {
+        while let Ok(backward) = rx.recv() {
+            // 引擎可能正被按键线程占着：短暂重试几次，别把这次点击丢掉。
+            let mut eng = None;
+            for _ in 0..40 {
+                match engine.try_lock() {
+                    Ok(guard) => {
+                        eng = Some(guard);
+                        break;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        eng = Some(poisoned.into_inner());
+                        break;
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
+            let Some(mut eng) = eng else {
+                continue;
+            };
+            let _ = change_rime_page(&mut eng, &context, &window, 0, backward);
+        }
+    });
+}
+
+/// 候选栏 `‹`/`›` 点击：投递到翻页队列，UI 线程立即返回。
+pub fn request_page_from_ui(backward: bool) {
+    if let Some(tx) = PAGE_TX.get() {
+        let _ = tx.send(backward);
+    }
+}
+
 pub fn run_ipc_server(
     engine: Arc<std::sync::Mutex<RimeEngine>>,
     context: Arc<SharedInputContext>,
@@ -29,6 +82,7 @@ pub fn run_ipc_server(
 ) {
     let pipe_path = get_pipe_path();
     tracing::info!("Winxime Server: creating named pipe at {}", pipe_path);
+    set_page_targets(&engine, &context, &window);
 
     let sd = match SecurityDescriptor::deserialize(u16cstr!("D:(A;;GA;;;WD)")) {
         Ok(sd) => sd,
@@ -458,6 +512,60 @@ fn handle_key_event(
         }
     }
 
+    // 内置计算器（crate::calculator）：激活期间先于建议词/英文态/rime——
+    // 联想模式下数字是选字键，绝不能被别的路径抢走。Delegated 表示计算器已退出、
+    // 键继续走原有流程（后续流程会收尾组词串）。
+    if crate::calculator::is_active() {
+        if let IpcRequestData::KeyEvent(key) = &request.data {
+            match crate::calculator::handle_active_key(
+                key.keycode,
+                key.modifiers,
+                request.session_id,
+                eng,
+                context,
+                window,
+            ) {
+                crate::calculator::ActiveKeyOutcome::Handled(response) => return *response,
+                crate::calculator::ActiveKeyOutcome::Delegated => {}
+                crate::calculator::ActiveKeyOutcome::NotAKeyDown => {
+                    // 激活期间的 key-up 绝不能落到普通路径：那里在
+                    // `!eng.is_composing()` 时会 `window.hide()`，于是每按一个键的抬起
+                    // 都把刚显示的候选栏收掉——实机上就是「候选只闪一下」。
+                    // 这里直接回一个被拒的应答：宿主不会调度编辑会话，键抬起也无需
+                    // 交给 rime（计算器不经过 rime）。
+                    return IpcResponse {
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::fail(request.session_id)
+                    };
+                }
+            }
+        }
+    }
+
+    // B2 原型：数字开头的影子缓冲（默认关闭，见 calculator::auto_detect_enabled）。
+    // 激活期间与计算器一样，key-up 不能落到普通路径（否则会把影子组词串收掉）。
+    if crate::calculator::shadow_active() {
+        if let IpcRequestData::KeyEvent(key) = &request.data {
+            match crate::calculator::handle_shadow_key(
+                key.keycode,
+                key.modifiers,
+                request.session_id,
+                eng,
+                context,
+                window,
+            ) {
+                crate::calculator::ActiveKeyOutcome::Handled(response) => return *response,
+                crate::calculator::ActiveKeyOutcome::Delegated => {}
+                crate::calculator::ActiveKeyOutcome::NotAKeyDown => {
+                    return IpcResponse {
+                        status: Some(get_ipc_status(eng)),
+                        ..IpcResponse::fail(request.session_id)
+                    };
+                }
+            }
+        }
+    }
+
     let is_ascii = ascii_mode.load(Ordering::Acquire);
     tracing::info!("Key event, ascii_mode={}", is_ascii);
 
@@ -552,6 +660,51 @@ fn handle_key_event(
             status: Some(get_ipc_status(eng)),
             ..IpcResponse::fail(request.session_id)
         };
+    }
+
+    // 内置计算器入口：组词串为空时按 `=`。方案自带功能占用触发键时让位
+    // （见 calculator::trigger_blocked 的动态检测），`=` 照常走 rime。
+    // 放在英文态早退之后：英文态下输入法是透明的，不接管任何键。
+    if let IpcRequestData::KeyEvent(key) = &request.data {
+        if key.keycode == librime::key::XK_EQUAL
+            && key.modifiers
+                & (librime::key::K_CONTROL_MASK
+                    | librime::key::K_ALT_MASK
+                    | librime::key::K_RELEASE_MASK) as i32
+                == 0
+        {
+            if let Some(response) =
+                crate::calculator::try_enter(eng, request.session_id, context, window)
+            {
+                return response;
+            }
+        }
+    }
+
+    // B2 原型入口：组词串为空时按下数字，先把数字吞进影子缓冲；等出现运算符
+    // 再切成算式。非算式键由 shadow_replay 回放（先提交数字、再注入当前键）。
+    // 默认关闭（见 calculator::auto_detect_enabled）。
+    if let IpcRequestData::KeyEvent(key) = &request.data {
+        let plain = key.modifiers
+            & (librime::key::K_CONTROL_MASK
+                | librime::key::K_ALT_MASK
+                | librime::key::K_RELEASE_MASK) as i32
+            == 0;
+        if plain && crate::calculator::is_shadow_starter(key.keycode) && !eng.is_composing() {
+            let no_suggestion = context.read(|c| c.suggestion_state.is_none());
+            if no_suggestion {
+                if let Some(response) = crate::calculator::try_enter_shadow(
+                    key.keycode,
+                    key.modifiers,
+                    request.session_id,
+                    eng,
+                    context,
+                    window,
+                ) {
+                    return response;
+                }
+            }
+        }
     }
 
     let handled = match &request.data {
@@ -672,6 +825,8 @@ fn handle_dict_command(
                 _ => None,
             };
             tracing::info!("ListDictEntries requested: {:?}", query.as_ref().map(|q| &q.0));
+            // 读词条会重建 rime 会话（见下方 with_user_dict_closed），组词串随之消失。
+            crate::calculator::reset("ListDictEntries");
             let outcome = match query {
                 // 读词条 = 让 librime **导出一份用户词典文本**再解析；而 librime 要求
                 // user dict 在 Export 前处于**关闭**状态（与 Import/Backup/Restore 同一条约束）。
@@ -714,6 +869,8 @@ fn handle_dict_command(
                 _ => None,
             };
             tracing::info!("ImportDictEntry requested");
+            // 写词条同样会重建会话，计算器缓冲一起清（见下方 with_user_dict_closed）。
+            crate::calculator::reset("ImportDictEntry");
             let outcome = match entry {
                 Some((dict, word, code, commits)) => {
                     let result = eng.with_user_dict_closed(move || {
@@ -920,6 +1077,9 @@ fn process_request(
 
         IpcCommand::StartSession => {
             tracing::info!("StartSession");
+            // 新会话不可能还有上一次会话的组词串；缓冲留着只会在新文档里
+            // 「复活」一个没人画得出的算式。
+            crate::calculator::reset("StartSession");
             IpcResponse {
                 status: Some(get_ipc_status(&eng)),
                 ..IpcResponse::ok(request.session_id)
@@ -928,6 +1088,7 @@ fn process_request(
 
         IpcCommand::EndSession => {
             tracing::info!("EndSession");
+            crate::calculator::reset("EndSession");
             IpcResponse::ok(request.session_id)
         }
 
@@ -940,10 +1101,24 @@ fn process_request(
         }
 
         IpcCommand::FocusOut => {
+            // B2：宿主失焦时先把影子缓冲里的数字取出来，放进回包的 commit 里，
+            // 由 TSF 在**旧 context** 上提交（TSF 的 FocusOut 已改为同步请求）。
+            // 计算器 B1 的算式仍按原行为丢弃（未完成算式不该悄悄上屏）。
+            let pending_digits = crate::calculator::take_shadow_for_flush();
             tracing::info!("FocusOut -> hide composition");
             eng.clear_composition();
+            crate::calculator::reset("FocusOut");
             window.hide();
-            IpcResponse::ok(request.session_id)
+            let context = pending_digits.map(|digits| winxime_ipc::Context {
+                preedit: winxime_ipc::Text { str: String::new() },
+                commit: Some(digits),
+                candidates: winxime_ipc::CandidateInfo::default(),
+            });
+            IpcResponse {
+                context,
+                status: Some(get_ipc_status(&eng)),
+                ..IpcResponse::ok(request.session_id)
+            }
         }
 
         IpcCommand::ProcessKeyEvent => {
@@ -963,6 +1138,8 @@ fn process_request(
 
         IpcCommand::ToggleAsciiMode => {
             tracing::info!("ToggleAsciiMode requested");
+            // 计算器组的是自己的串：切换中英会重建 rime 状态，缓冲必须一起清。
+            crate::calculator::reset("ToggleAsciiMode");
             let current = eng.is_ascii_mode();
             let new_mode = !current;
             tracing::info!("  -> current={}, setting to {}", current, new_mode);
@@ -1047,10 +1224,21 @@ fn process_request(
             tracing::info!("ReloadConfig requested");
             // 配置可能被设置程序改过：先丢缓存，redeploy 之后的状态与样式都从新配置出。
             crate::config::invalidate();
+            // 方案可能被换掉：触发键让位检测按方案 id 缓存，必须一起失效。
+            crate::calculator::invalidate_trigger_cache();
+            // redeploy 会重建会话，计算器画在宿主里的组词串一并作废。
+            crate::calculator::reset("ReloadConfig");
             // 候选数量变了要把 rime 的 `menu/page_size` 一起对齐，否则部署完还是老页大小。
             let (_, user_dir) = xime_config::get_data_dirs();
             crate::sync_rime_page_size(&user_dir, crate::config::get().style.candidate_count);
-            let deploy_result = eng.redeploy();
+            let mut deploy_result = eng.redeploy();
+            if !deploy_result {
+                // 设置页自己也刚跑过一次部署，两个进程的文件/缓存状态可能差一拍；
+                // 重试一次，避免把「第二次就好」的情况当成失败通知给用户。
+                tracing::warn!("redeploy 第一次返回 false，200ms 后重试");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                deploy_result = eng.redeploy();
+            }
             // 部署会重建会话：**部署后引擎实际用的是哪个方案**必须留痕。
             // 「部署完又回到 emoji」这类问题，看这一行就够了。
             tracing::info!(
@@ -1062,6 +1250,13 @@ fn process_request(
             let status = get_ipc_status(&eng);
             if deploy_result {
                 crate::notify::notify(format!("已部署「{}」", status.schema_name));
+            } else if eng.get_current_schema().is_some() {
+                // 有 active schema 说明引擎还在正常工作，多半是设置页那边的部署
+                // 已经成功、这次 redeploy 只是重复动作。只留日志，不打扰用户。
+                tracing::warn!(
+                    "redeploy 返回 false 但 active schema 仍在（{}），跳过失败通知",
+                    status.schema_name
+                );
             } else {
                 crate::notify::notify(format!(
                     "部署「{}」失败，详见 server.log",
@@ -1155,6 +1350,8 @@ fn process_request(
 
         IpcCommand::SelectSchema => {
             tracing::info!("SelectSchema requested");
+            // 方案变了，「`=` 是否被方案占用」的检测结果作废。
+            crate::calculator::invalidate_trigger_cache();
             let schema_id = match &request.data {
                 winxime_ipc::IpcRequestData::SelectSchema(id) => Some(id.clone()),
                 _ => None,
@@ -1275,36 +1472,7 @@ fn process_request(
                 winxime_ipc::IpcRequestData::SelectIndex(i) => *i,
                 _ => 0,
             };
-
-            tracing::info!("  -> selecting candidate at index {}", index);
-            let selected = eng.select_candidate(index);
-            tracing::info!("  -> select result: {}", selected);
-
-            let commit = eng.get_commit();
-            tracing::info!("  -> commit: {:?}", commit);
-
-            let ipc_ctx = get_ipc_context(&eng, &commit);
-            update_context(&mut eng, context, &commit);
-
-            if commit.is_some() {
-                tracing::info!("  -> hide (commit after select)");
-                window.hide();
-            } else if !eng.is_composing() {
-                tracing::info!("  -> hide (not composing after select)");
-                window.hide();
-            } else if let Some(ctx) = &ipc_ctx {
-                let pos = context.read(|c| (c.caret_x, c.caret_y));
-                window.show(pos.0, pos.1);
-                window.update(ctx);
-            }
-
-            IpcResponse {
-                success: selected,
-                session_id: request.session_id,
-                context: ipc_ctx,
-                status: Some(get_ipc_status(&eng)),
-                ..IpcResponse::default()
-            }
+            select_rime_candidate(&mut eng, context, window, request.session_id, index)
         }
 
         IpcCommand::ChangePage => {
@@ -1313,25 +1481,7 @@ fn process_request(
                 winxime_ipc::IpcRequestData::ChangePage(b) => *b,
                 _ => false,
             };
-
-            tracing::info!("  -> backward: {}", backward);
-            let changed = eng.change_page(backward);
-            tracing::info!("  -> change result: {}", changed);
-
-            let ipc_ctx = get_ipc_context(&eng, &None);
-            if let Some(ctx) = &ipc_ctx {
-                let pos = context.read(|c| (c.caret_x, c.caret_y));
-                window.show(pos.0, pos.1);
-                window.update(ctx);
-            }
-
-            IpcResponse {
-                success: changed,
-                session_id: request.session_id,
-                context: ipc_ctx,
-                status: Some(get_ipc_status(&eng)),
-                ..IpcResponse::default()
-            }
+            change_rime_page(&mut eng, context, window, request.session_id, backward)
         }
 
         _ => IpcResponse::fail(request.session_id),
@@ -1389,21 +1539,99 @@ fn parse_rime_selected_schema(content: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 处理候选栏面板的「点击上屏」触发键（server 自己 `SendInput` 注入的 VK_F24，
+/// 选中当前页第 `index` 个候选（IPC `SelectCandidate` 与「点击候选」自注入共用）。
+fn select_rime_candidate(
+    eng: &mut RimeEngine,
+    context: &std::sync::Arc<SharedInputContext>,
+    window: &CandidateWindow,
+    session_id: u32,
+    index: usize,
+) -> IpcResponse {
+    tracing::info!("  -> selecting candidate at index {}", index);
+    let selected = eng.select_candidate(index);
+    tracing::info!("  -> select result: {}", selected);
+
+    let commit = eng.get_commit();
+    tracing::info!("  -> commit: {:?}", commit);
+
+    let ipc_ctx = get_ipc_context(eng, &commit);
+    update_context(eng, context, &commit);
+
+    if commit.is_some() {
+        tracing::info!("  -> hide (commit after select)");
+        window.hide();
+    } else if !eng.is_composing() {
+        tracing::info!("  -> hide (not composing after select)");
+        window.hide();
+    } else if let Some(ctx) = &ipc_ctx {
+        let pos = context.read(|c| (c.caret_x, c.caret_y));
+        window.show(pos.0, pos.1);
+        window.update(ctx);
+    }
+
+    IpcResponse {
+        success: selected,
+        session_id,
+        context: ipc_ctx,
+        status: Some(get_ipc_status(eng)),
+        ..IpcResponse::default()
+    }
+}
+
+/// 处理候选栏/面板的「点击」触发键（server 自己 `SendInput` 注入的 VK_F24，
 /// 见 [`crate::paste`]）。
 ///
-/// - key down：取走待上屏文本，清掉当前编码串，把文本作为 `commit` 回包——
-///   宿主拿到 commit 会用提交文本替换掉当前 composition 并结束它，于是文本
-///   经正常的 TSF 编辑会话落到光标处（`success: true` 同时让宿主吃掉这个键）。
+/// - key down：先看有没有「待选中候选」载荷，有就让 rime 选中那一条；否则取走
+///   待上屏文本，清掉当前编码串，把文本作为 `commit` 回包。宿主拿到 commit 会用
+///   提交文本替换掉当前 composition 并结束它，于是内容经正常的 TSF 编辑会话落到
+///   光标处（`success: true` 同时让宿主吃掉这个键）。
 /// - key up：照样回 `success: true`（不漏给前台应用），但不带 commit。
+fn change_rime_page(
+    eng: &mut RimeEngine,
+    context: &std::sync::Arc<SharedInputContext>,
+    window: &CandidateWindow,
+    session_id: u32,
+    backward: bool,
+) -> IpcResponse {
+    tracing::info!("  -> backward: {}", backward);
+    let changed = eng.change_page(backward);
+    tracing::info!("  -> change result: {}", changed);
+
+    let ipc_ctx = get_ipc_context(eng, &None);
+    if let Some(ctx) = &ipc_ctx {
+        let pos = context.read(|c| (c.caret_x, c.caret_y));
+        window.show(pos.0, pos.1);
+        window.update(ctx);
+    }
+
+    IpcResponse {
+        success: changed,
+        session_id,
+        context: ipc_ctx,
+        status: Some(get_ipc_status(eng)),
+        ..IpcResponse::default()
+    }
+}
+
 fn handle_paste_trigger(
     eng: &mut RimeEngine,
-    context: &SharedInputContext,
+    context: &std::sync::Arc<SharedInputContext>,
     window: &CandidateWindow,
     session_id: u32,
     modifiers: i32,
 ) -> IpcResponse {
     let released = modifiers & librime::K_RELEASE_MASK as i32 != 0;
+    // 面板上屏/候选点选会替换掉当前组词串：计算器缓冲若还开着，必须先退。
+    crate::calculator::reset("paste trigger");
+
+    // 普通 rime 候选点选：让 rime 自己选中（保留词频/学习语义），
+    // 与「粘贴面板直接上屏文本」是同一个触发键、不同载荷。
+    if released {
+        let _ = crate::paste::take_pending_select();
+    } else if let Some(index) = crate::paste::take_pending_select() {
+        return select_rime_candidate(eng, context, window, session_id, index);
+    }
+
     let text = if released {
         None
     } else {
@@ -1437,7 +1665,7 @@ fn handle_paste_trigger(
     }
 }
 
-fn get_ipc_status(eng: &RimeEngine) -> winxime_ipc::Status {
+pub(crate) fn get_ipc_status(eng: &RimeEngine) -> winxime_ipc::Status {
     let status = eng.get_status();
     winxime_ipc::Status {
         // 按键热路径：这里**不**填 speech（它要查模型目录），留 None；

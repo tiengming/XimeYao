@@ -1,9 +1,9 @@
-﻿# Rebuild Xime and test with the real install effect (MSIX development registration).
+# Rebuild Xime and test with the real install effect (MSIX development registration).
 #
 # Flow mirrors msix-bundle.ps1 -Register, so testing happens against the exact
 # layout that gets installed:
 #   1. build release (windows_subsystem -> no console window)
-#   2. stage install layout to target\msix-pkg (binaries + rime.dll + data + user-data + resources)
+#   2. stage install layout to target\msix-pkg (binaries + rime.dll + user-data + resources)
 #   3. Add-AppxPackage -Register (loose-file development registration = install effect)
 #   4. start winxime-server.exe from the staged layout (same as MSI's StartServer action)
 #
@@ -53,6 +53,22 @@ if (-not $isAdmin) {
 
 # cargo 与 msix-bundle.ps1 都按仓库根目录解析相对路径；提权重启后 cwd 是 System32，统一锚定。
 Set-Location -LiteralPath $PSScriptRoot
+
+# 文件沙箱探测：server 必须能写 %APPDATA%\Xime（日志/方案注册表/用户词典/剪贴板库）。
+# Agent/DSH 的终端常把命令限制在工作区内（workspace-write）：cargo 能写 target/，
+# 但 server 一启动就因「拒绝访问」在日志初始化阶段失败，表现为「Server did not start」。
+# 提前用探针文件判定，避免把沙箱限制误判成程序 bug。
+$probe = Join-Path $env:APPDATA ".xime-rebuild-probe"
+try {
+    Set-Content -LiteralPath $probe -Value "probe" -Encoding ascii -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+} catch {
+    Write-Host "ERROR: 当前终端不能写 $env:APPDATA（文件沙箱或权限限制）。" -ForegroundColor Red
+    Write-Host "       server 需要写 $env:APPDATA\Xime（日志/方案注册表/用户词典）；" -ForegroundColor Yellow
+    Write-Host "       在受限终端里它会因「拒绝访问」启动失败，这不是程序 bug。" -ForegroundColor Yellow
+    Write-Host "       请改用普通管理员 PowerShell / Windows Terminal，或从资源管理器运行本脚本。" -ForegroundColor Yellow
+    exit 1
+}
 
 # libquickjs-ng-sys 的 build.rs 在非 Android 平台硬编码 `cc.compiler("clang")`：
 # clang.exe 必须在 PATH 上，否则 release 构建在 quickjs 这一步直接失败
@@ -147,18 +163,40 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# server 以 Medium 运行（工作区 Low 标签会连带降 exe，必须抬回来），写不了 HKLM；
+# TSF 的 DLL 复制与注册由 rebuild（管理员）在这里显式完成。tsf-register 的
+# 完整性标签在 msix-bundle 里抬到 High。
+$tsfRegister = Join-Path $packageDir "winxime-tsf-register.exe"
+$tsfDll = Join-Path $packageDir "winxime_tsf.dll"
+$tsfIcon = Join-Path $packageDir "resources\icon.ico"
+if ((Test-Path $tsfRegister) -and (Test-Path $tsfDll) -and (Test-Path $tsfIcon)) {
+    Write-Host "Step 3b: Registering TSF DLL..." -ForegroundColor Yellow
+    & $tsfRegister -copy-and-register $tsfDll $tsfIcon
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "TSF registration failed (exit $LASTEXITCODE); server will retry at startup." -ForegroundColor Red
+    }
+}
+
 Write-Host "Step 4: Starting server from the staged layout..." -ForegroundColor Yellow
-Start-Process -FilePath "$packageDir\winxime-server.exe"
+$server = Start-Process -FilePath "$packageDir\winxime-server.exe" -PassThru
 Start-Sleep -Seconds 3
 
-if (Get-Process -Name "winxime-server" -ErrorAction SilentlyContinue) {
+if ($server -and -not $server.HasExited) {
     Write-Host ""
     Write-Host "Done! Server is running from the installed layout (no console window)." -ForegroundColor Green
     Write-Host "  Package layout: $packageDir" -ForegroundColor White
-    Write-Host "  Logs:           $env:TEMP\winxime\*.log" -ForegroundColor White
+    Write-Host "  Logs:           $env:APPDATA\Xime\logs\*.log" -ForegroundColor White
     Write-Host "Test input in Notepad or any application." -ForegroundColor White
     Write-Host "NOTE: TSF DLL 是进程内加载的，请关掉重开要测试的应用（旧进程仍用旧 DLL）" -ForegroundColor Yellow
 } else {
-    Write-Host "Server did not start; check logs at $env:TEMP\winxime" -ForegroundColor Red
+    # 进程启动后立刻退出时不打印退出码的话，只会看到一句「Server did not start」，
+    # 无法区分 loader / panic / 业务早期退出。这里把退出码和日志候选路径都打出来。
+    if ($server) {
+        Write-Host ("Server exited immediately (exit code 0x{0:X8} / {0})." -f $server.ExitCode) -ForegroundColor Red
+    } else {
+        Write-Host "Server could not be started." -ForegroundColor Red
+    }
+    Write-Host "  Logs: $env:APPDATA\Xime\logs\server.log" -ForegroundColor White
+    Write-Host "  （若日志初始化失败，server 会把原因写到 stderr，或回退到 $env:TEMP\xime\logs）" -ForegroundColor White
     exit 1
 }

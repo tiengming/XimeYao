@@ -1,4 +1,4 @@
-﻿# MSI build script
+# MSI build script
 #
 # 用法：
 #   .\msi-build.ps1                  # CPU 包（默认，target\release）
