@@ -105,6 +105,14 @@ foreach ($dll in $optionalDlls) {
 # 2. data/ 不再分发（librime\data\minimal 的示例方案与语料会混入用户 rime
 #    目录）。rime-wubi（user-data/）自包含全部所需文件（default.yaml /
 #    symbols.yaml 均有），server 的 ensure_rime_data 会跳过不存在的 data/。
+#    旧包目录可能因文件占用无法整目录腾空，单独把残留 data/ 再清一次，避免
+#    rebuild 后仍用旧 data 当 seed。
+if (Test-Path "$packageDir\data") {
+    Remove-Item "$packageDir\data" -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path "$packageDir\data") {
+        Write-Warning "旧 data/ 未能删除；本次包仍会优先使用 user-data seed，请关闭占用后重试"
+    }
+}
 
 # 3. Copy rime-wubi data (to user-data/, deployed to %APPDATA% on first run)
 Write-Host "Step 3: Copying rime-wubi data..." -ForegroundColor Yellow
@@ -129,6 +137,13 @@ foreach ($file in $rimeWubiFiles) {
     $destDir = Split-Path -Parent $destPath
     if (-not (Test-Path $destDir)) { New-Item $destDir -ItemType Directory -Force | Out-Null }
     Copy-Item $file.FullName $destPath -Force
+}
+
+# 3.5 安装包自带的补充方案（cangjie5 / luna_pinyin / essay.txt）：
+# 这些也是用户升级后仍应算「内置」的方案，和 rime-wubi 一起进入 user-data seed。
+if (Test-Path "builtin-extra") {
+    Write-Host "Step 3.5: Copying builtin-extra seed..." -ForegroundColor Yellow
+    Copy-Item "builtin-extra\*" "$packageDir\user-data" -Recurse -Force
 }
 
 # 4. Copy resources

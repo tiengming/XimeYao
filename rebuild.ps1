@@ -3,7 +3,7 @@
 # Flow mirrors msix-bundle.ps1 -Register, so testing happens against the exact
 # layout that gets installed:
 #   1. build release (windows_subsystem -> no console window)
-#   2. stage install layout to target\msix-pkg (binaries + rime.dll + data + user-data + resources)
+#   2. stage install layout to target\msix-pkg (binaries + rime.dll + user-data + resources)
 #   3. Add-AppxPackage -Register (loose-file development registration = install effect)
 #   4. start winxime-server.exe from the staged layout (same as MSI's StartServer action)
 #

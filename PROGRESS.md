@@ -3363,3 +3363,4 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
   `patch` 导致 `schema_list` 被 librime 丢弃、build 为空、方案全「未启用」。
 - **验证**：`xime-config` schema_manager 4 passed；`xime-setup-lib --features voice-page`
   44 passed / 1 ignored；XimeYao `cargo test --workspace` 131 passed / 1 ignored；clippy 0。
+- **补充 seed**：cangjie5 / luna_pinyin / essay.txt 加入 `builtin-extra/`，由 `msix-bundle.ps1` 与 `msi-build.ps1` 一起放进 `user-data`；它们是安装包自带方案，新装/升级都标内置；`data/` 仍不分发。
