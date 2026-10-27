@@ -1270,5 +1270,17 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
 - **回滚**：`xime.custom.yaml` 写 `calculator: { auto_detect: false }` 即恢复纯数字输入；
   用户当前配置已写 `true`（备份 `xime.custom.yaml.bak-20261026`）。
 - **旧决策的关系**：本节取代「B2 转正」条里的「默认关闭」；失焦/空闲/去重设计不变。
+
+## 2026-10-27 设置页方案列表：后台快照 + 冲突预检短路
+
+- **安装/卸载后的重扫不能在 UI 线程**：`get_schema_list()` 要逐 `*.schema.yaml`
+  读盘解析，装完一个包后正好在消息循环里跑，表现为设置窗口卡一下。改成后台线程
+  算 `SchemaSnapshot`，UI 下一次 poll 一次性替换；`schema_loaded` 的语义仍是「已有
+  一份可用列表」，不阻塞页面。
+- **冲突预检不再无条件递归扫**：注册表已有 `builtin` 时跳过
+  `refresh_builtin_package()`；只有首次运行/没有 builtin 时才扫。这样「安装中…」
+  能在点击后立刻出现。
+- **`RimeSyncNow` 保持后台**：同步是 DBus + 快照导出，不能进 UI 线程；已有
+  `start_sync`/`poll_sync` 机制，本次审计确认无需改。
 - **命中与绘制同源**：hover 命中复用 `layout::candidate_item_at`，与点击、绘制共用
   同一套几何；不会出现「高亮了一个格子、点到的却是另一个」。

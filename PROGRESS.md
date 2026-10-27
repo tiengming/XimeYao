@@ -3327,3 +3327,17 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
 - **验证**：`cargo test --workspace` = **136 passed / 1 ignored**；clippy 0；
   release 已暂存（19:0x），server 已停。
 - **待提交**：本轮的候选栏菜单/滚轮翻页 + B2 默认开启（工作树未提交）。
+
+### 2026-10-27 M3：设置页 P0 冻结残余
+
+- **安装/卸载后的方案重扫移出 UI 线程**：`poll_market_task` 收到
+  Install/Uninstall/BuiltinRestored 后只 `start_schema_reload_async()`；后台线程
+  计算 `SchemaSnapshot`（方案列表/归属包/可还原/已部署），UI 在
+  `poll_schema_reload` 一次性替换，消息循环不再逐 `*.schema.yaml` 读盘解析。
+- **冲突预检短路**：`schema_install_conflict` / `schema_restore_conflict` 仅在注册表
+  没有内置包时才 `refresh_builtin_package()` 递归扫描；已有 builtin 时直接读注册表，
+  点「安装」后 loading 立即出现。
+- **RimeSyncNow** 此前已改为后台（`start_sync` + `poll_sync`），本次确认无需再动。
+- **验证**：`cargo test -p xime-setup-lib --features voice-page` = **41 passed / 1 ignored**；
+  XimeYao `cargo test --workspace` = **136 passed / 1 ignored**，clippy 0；release 暂存，
+  `winxime-setup.exe` 已更新。用户实测安装/卸载/还原无冻结。
