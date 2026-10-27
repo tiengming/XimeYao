@@ -3341,3 +3341,25 @@ moqi 方案依赖 10 个 lua 组件（3 filter / 1 processor / 6 translator）�
 - **验证**：`cargo test -p xime-setup-lib --features voice-page` = **41 passed / 1 ignored**；
   XimeYao `cargo test --workspace` = **136 passed / 1 ignored**，clippy 0；release 暂存，
   `winxime-setup.exe` 已更新。用户实测安装/卸载/还原无冻结。
+
+## 2026-10-27 方案来源管理 + 导入方案
+
+- **内置方案只认安装包 seed**：`builtin` 由 `install/data` + `install/user-data` 重建；
+  旧 builtin 里不是 seed 的文件转 `local`，不删原文件；`*.custom.yaml.bak/.orig` 不再入清单。
+- **清理/恢复内置**：`clean_builtin_schema()` 先部署并切换到剩余方案，再删 builtin 文件
+  并写 `.builtin-removed`；server 重启不再注入。恢复从 `market/builtin/` 还原并清标记。
+- **删除下载包**：已安装时 UI 禁用并提示先卸载，状态层也会拒绝。
+- **导入方案弹窗**：支持拖入、本地路径/浏览、远程 URL、剪贴板文件/文本；先复制/下载到
+  `market/<名称>/`，再走正常安装/冲突/隔离流程。
+- **导入可靠性**：
+  - 安装前 `validate_package_archive()` 预检，坏包不再先卸载旧方案；
+  - 自动下钻单层/多层同名目录，找不到顶层 `.schema.yaml` 才拒绝；
+  - 方案名称从文件名人性化（`rime-ice` → `Rime Ice`），可改；
+  - 进度条：已知总大小按比例，未知时扫描块动画，显示已下载/总大小/速度；文件对话框
+    移到后台线程，大目录不再冻结 UI。
+- **切换未部署方案**：先通知「尚未部署，正在部署，请等待」，部署后重试选中 6 次；
+  不再立刻弹失败。
+- **根因修复**：`replace_schema_list()` 在已有 `patch` 时改为插入同一 patch，避免重复
+  `patch` 导致 `schema_list` 被 librime 丢弃、build 为空、方案全「未启用」。
+- **验证**：`xime-config` schema_manager 4 passed；`xime-setup-lib --features voice-page`
+  44 passed / 1 ignored；XimeYao `cargo test --workspace` 131 passed / 1 ignored；clippy 0。

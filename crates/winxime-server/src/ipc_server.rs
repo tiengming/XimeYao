@@ -1231,7 +1231,14 @@ fn process_request(
             // 候选数量变了要把 rime 的 `menu/page_size` 一起对齐，否则部署完还是老页大小。
             let (_, user_dir) = xime_config::get_data_dirs();
             crate::sync_rime_page_size(&user_dir, crate::config::get().style.candidate_count);
-            let deploy_result = eng.redeploy();
+            let mut deploy_result = eng.redeploy();
+            if !deploy_result {
+                // 设置页自己也刚跑过一次部署，两个进程的文件/缓存状态可能差一拍；
+                // 重试一次，避免把「第二次就好」的情况当成失败通知给用户。
+                tracing::warn!("redeploy 第一次返回 false，200ms 后重试");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                deploy_result = eng.redeploy();
+            }
             // 部署会重建会话：**部署后引擎实际用的是哪个方案**必须留痕。
             // 「部署完又回到 emoji」这类问题，看这一行就够了。
             tracing::info!(
@@ -1243,6 +1250,13 @@ fn process_request(
             let status = get_ipc_status(&eng);
             if deploy_result {
                 crate::notify::notify(format!("已部署「{}」", status.schema_name));
+            } else if eng.get_current_schema().is_some() {
+                // 有 active schema 说明引擎还在正常工作，多半是设置页那边的部署
+                // 已经成功、这次 redeploy 只是重复动作。只留日志，不打扰用户。
+                tracing::warn!(
+                    "redeploy 返回 false 但 active schema 仍在（{}），跳过失败通知",
+                    status.schema_name
+                );
             } else {
                 crate::notify::notify(format!(
                     "部署「{}」失败，详见 server.log",

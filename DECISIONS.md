@@ -1284,3 +1284,20 @@ Windows 侧把安卓的 `.manifests/<pkg>.json` + `.registry.json` 收敛成一�
   `start_sync`/`poll_sync` 机制，本次审计确认无需改。
 - **命中与绘制同源**：hover 命中复用 `layout::candidate_item_at`，与点击、绘制共用
   同一套几何；不会出现「高亮了一个格子、点到的却是另一个」。
+
+## 2026-10-27 方案来源、内置清理与导入
+
+- **builtin = 安装包 seed**：只认 `install/data` + `install/user-data`；历史/用户手放文件
+  归 `local`，不删除；`.custom.yaml.bak` 等配置备份不进入任何包清单。
+- **清理内置**：先切换并部署剩余非内置方案，再删文件并写 `.builtin-removed`；marker
+  让 server 不再注入 seed，恢复时清除。
+- **坏包不能先删旧方案**：安装冲突确认改为先 `validate_package_archive()`，通过后才
+  卸载旧包；解压根自动下钻单层/多层同名目录。
+- **导入方案**：本地包/URL/拖入/剪贴板统一落到 `market/<名称>/`，走正常安装与来源隔离；
+  名称面向用户，允许中文/空格，冲突不覆盖。
+- **切换通知**：未部署方案先提示「正在部署，请等待」，ReloadConfig 后重试选中；只有
+  重试仍失败才报错，避免把引擎异步重建误报成失败。
+- **文件对话框后台化**：`rfd` 不能在 UI 线程同步打开大目录，否则整窗卡死；移到后台线程
+  并轮询结果。
+- **schema_list 写入**：已有 `patch` 时插入同一 patch，禁止重复顶层 `patch`；否则
+  librime 只取第一个 patch，列表丢失→无 build→全部「未启用」。
