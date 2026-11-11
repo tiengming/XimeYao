@@ -8,7 +8,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
 };
-use tracing::{debug, info};
+// `info` 均以 `tracing::info!` 全路径使用（初始化/词典管理等低频事件）；
+// 按键热路径已全部降为 trace（U-10），这里只导入 debug 供托盘等分支使用。
+use tracing::debug;
 use widestring::U16CString;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
@@ -627,13 +629,46 @@ fn handle_update_position(
 ) -> IpcResponse {
     if let IpcRequestData::Position(pos) = &request.data {
         // 每次按键都来一次，`info!` 会把日志写爆；排查定位问题时再开 trace。
-        tracing::trace!("Position: {},{}", pos.x, pos.y);
+        tracing::trace!("Position: {},{},{}", pos.x, pos.y, pos.height);
         context.update(|ctx| {
             ctx.caret_x = pos.x;
             ctx.caret_y = pos.y;
+            ctx.caret_height = pos.height;
         });
     }
     IpcResponse::ok(request.session_id)
+}
+
+/// 组词串被宿主终止（**单向命令**，客户端不等回包）。
+///
+/// 典型场景：自动识别把数字挂进组词串后，用户在应用里点了别处，应用收掉
+/// 组词串。此刻数字已原样留在文档里（TSF 终止组词串不会删文本），但影子
+/// 缓冲的空闲提交线程还攥着同一份数字——2.5 秒后它会注入 F24，把数字再
+/// 插到**当时的光标位置**（往往是点击处）。收到这条通知就必须把影子缓冲
+/// 与空闲提交一并作废，等价于失焦收尾，只是没有旧 context 可提交。
+fn handle_composition_terminated(session_id: u32) -> IpcResponse {
+    if let Some(digits) = crate::calculator::take_shadow_for_flush() {
+        tracing::info!(
+            "自动识别：组词串被宿主终止，放弃空闲提交（{count} 字留在原地）",
+            count = digits.chars().count()
+        );
+    }
+    crate::calculator::reset("CompositionTerminated");
+    IpcResponse::ok(session_id)
+}
+
+/// 面板快捷键（**单向命令**，客户端不等回包）。
+///
+/// TSF 侧识别到「打开面板」热键后发来本命令；这里不碰引擎，只把切换动作
+/// 转投到候选栏窗口（`WM_TOGGLE_PANEL`），由 UI 线程处理——面板展开/收起
+/// （含动画）必须在对窗口句柄所属的 UI 线程上做。候选栏窗口句柄经
+/// `SharedInputContext` 的通知通道拿到（与托盘动作同一管道），这里只投递。
+fn handle_toggle_panel(
+    session_id: u32,
+    window: &Arc<CandidateWindow>,
+) -> IpcResponse {
+    window.post_toggle_panel();
+    IpcResponse::ok(session_id)
 }
 
 /// 系统通知（toast）。不碰引擎，锁外处理。
@@ -749,22 +784,21 @@ fn handle_key_event(
     }
 
     let is_ascii = ascii_mode.load(Ordering::Acquire);
-    tracing::info!("Key event, ascii_mode={}", is_ascii);
+    tracing::trace!("Key event, ascii_mode={}", is_ascii);
 
     let suggestion_state = context.read(|c| c.suggestion_state.clone());
 
     if let Some(ref suggestion) = suggestion_state {
-        tracing::info!(
-            "  -> in suggestion mode, suggestions: {:?}",
-            suggestion.suggestions
+        tracing::trace!(
+            "  -> in suggestion mode, {} suggestions",
+            suggestion.suggestions.len()
         );
 
         if let IpcRequestData::KeyEvent(key) = &request.data {
             if key.keycode == 32 {
-                tracing::info!("  -> Space in suggestion mode, commit suggestion");
+                tracing::trace!("  -> Space in suggestion mode, commit suggestion");
                 if suggestion.highlighted < suggestion.suggestions.len() {
                     let selected_word = &suggestion.suggestions[suggestion.highlighted];
-                    tracing::info!("  -> committing suggestion word: {}", selected_word);
 
                     context.update(|ctx| {
                         ctx.suggestion_state = None;
@@ -793,10 +827,9 @@ fn handle_key_event(
                 }
             } else if key.keycode >= 49 && key.keycode <= 57 {
                 let index = (key.keycode - 49) as usize;
-                tracing::info!("  -> Number key {} in suggestion mode", index + 1);
+                tracing::trace!("  -> Number key {} in suggestion mode", index + 1);
                 if index < suggestion.suggestions.len() {
                     let selected_word = &suggestion.suggestions[index];
-                    tracing::info!("  -> committing suggestion word: {}", selected_word);
 
                     context.update(|ctx| {
                         ctx.suggestion_state = None;
@@ -820,7 +853,7 @@ fn handle_key_event(
                     };
                 }
             } else {
-                tracing::info!(
+                tracing::trace!(
                     "  -> Other key in suggestion mode, clear suggestion and continue"
                 );
                 context.update(|ctx| {
@@ -837,7 +870,7 @@ fn handle_key_event(
     }
 
     if is_ascii {
-        tracing::info!("  -> ASCII mode, not handling");
+        tracing::trace!("  -> ASCII mode, not handling");
         return IpcResponse {
             status: Some(get_ipc_status(eng)),
             ..IpcResponse::fail(request.session_id)
@@ -891,18 +924,24 @@ fn handle_key_event(
 
     let handled = match &request.data {
         IpcRequestData::KeyEvent(key) => {
-            tracing::info!("Key: {} mod: {}", key.keycode, key.modifiers);
             let result = eng.process_key(key.keycode, key.modifiers);
-            tracing::info!("  handled: {}", result);
+            // 每键主链路只留这一条 trace（U-10）：键、裁决、组词态一行看全。
+            // 此前每键 7~10 条 info（含候选列表 Debug 转储）把 server.log 写到 43MB；
+            // commit 在下方统一落一条 `>>> COMMIT_TO_SCREEN`（info，低频）。
+            tracing::trace!(
+                "Key: {} mod: {} handled={} input={:?} composing={}",
+                key.keycode,
+                key.modifiers,
+                result,
+                eng.get_input(),
+                eng.is_composing()
+            );
             result
         }
         _ => false,
     };
 
     let commit = eng.get_commit();
-    tracing::info!("  commit: {:?}", commit);
-    info!("  input: {:?}", eng.get_input());
-    info!("  composing: {}", eng.is_composing());
 
     if let Some(ref commit_text) = commit {
         tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
@@ -914,7 +953,7 @@ fn handle_key_event(
     if let Some(ref commit_text) = commit {
         tracing::info!(">>> COMMIT_TO_SCREEN: '{}'", commit_text);
 
-        tracing::info!("  -> hide (commit)");
+        tracing::trace!("  -> hide (commit)");
         context.update(|ctx| {
             ctx.suggestion_state = None;
         });
@@ -927,7 +966,7 @@ fn handle_key_event(
             ..IpcResponse::default()
         }
     } else if !eng.is_composing() {
-        tracing::info!("  -> hide (not composing)");
+        tracing::trace!("  -> hide (not composing)");
         context.update(|ctx| {
             ctx.suggestion_state = None;
         });
@@ -940,16 +979,19 @@ fn handle_key_event(
             ..IpcResponse::default()
         }
     } else if let Some(ctx) = &ipc_ctx {
-        tracing::info!("  candies: {:?}", ctx.candidates.candies);
         if ctx.candidates.candies.is_empty() {
-            tracing::info!("  -> hide (no candidates)");
+            tracing::trace!("  -> hide (no candidates)");
             window.hide();
         } else {
-            let pos = context.read(|c| (c.caret_x, c.caret_y));
-            tracing::info!("  -> show at ({}, {})", pos.0, pos.1);
-            window.show(pos.0, pos.1);
-            info!("  -> update {} candies", ctx.candidates.candies.len());
-            window.update(ctx);
+            let anchor = context.read(|c| c.caret_anchor());
+            tracing::trace!(
+                "  -> show at ({}, {}, h={})，{} 个候选",
+                anchor.0,
+                anchor.1,
+                anchor.2,
+                ctx.candidates.candies.len()
+            );
+            window.show(anchor, ctx);
         }
 
         IpcResponse {
@@ -1242,6 +1284,17 @@ fn process_request(
         IpcCommand::UpdateInputPosition => {
             return handle_update_position(request, context);
         }
+        // 组词串被宿主终止（用户点了别处）：同样不碰引擎，且是单向命令。
+        // 必须立刻放弃影子缓冲的空闲提交——数字已经随组词串终止留在原文档，
+        // 再注入 F24 会把同样的数字插到**新光标位置**（重复一份）。
+        IpcCommand::CompositionTerminated => {
+            return handle_composition_terminated(request.session_id);
+        }
+        // 面板快捷键（TSF 侧识别）：不碰引擎，只把「切换面板」转投到候选栏
+        // 窗口（UI 线程处理，含展开/收起动画）。单向命令，无需回包。
+        IpcCommand::TogglePanel => {
+            return handle_toggle_panel(request.session_id, window);
+        }
         // 退出只是 PostThreadMessageW，跟引擎无关。留在锁后面的话，引擎正忙
         // （同步用户资料、重载配置、部署）时 `try_lock` 失败 → 直接回 fail，
         // 托盘「退出」点了没反应，用户只能去任务管理器杀进程。
@@ -1286,7 +1339,7 @@ fn process_request(
         },
 
         IpcCommand::StartSession => {
-            tracing::info!("StartSession");
+            tracing::debug!("StartSession");
             // 新会话不可能还有上一次会话的组词串；缓冲留着只会在新文档里
             // 「复活」一个没人画得出的算式。
             crate::calculator::reset("StartSession");
@@ -1297,13 +1350,13 @@ fn process_request(
         }
 
         IpcCommand::EndSession => {
-            tracing::info!("EndSession");
+            tracing::debug!("EndSession");
             crate::calculator::reset("EndSession");
             IpcResponse::ok(request.session_id)
         }
 
         IpcCommand::FocusIn => {
-            tracing::info!("FocusIn");
+            tracing::debug!("FocusIn");
             IpcResponse {
                 status: Some(get_ipc_status(&eng)),
                 ..IpcResponse::ok(request.session_id)
@@ -1315,7 +1368,7 @@ fn process_request(
             // 由 TSF 在**旧 context** 上提交（TSF 的 FocusOut 已改为同步请求）。
             // 计算器 B1 的算式仍按原行为丢弃（未完成算式不该悄悄上屏）。
             let pending_digits = crate::calculator::take_shadow_for_flush();
-            tracing::info!("FocusOut -> hide composition");
+            tracing::debug!("FocusOut -> hide composition");
             eng.clear_composition();
             crate::calculator::reset("FocusOut");
             window.hide();
@@ -1340,6 +1393,16 @@ fn process_request(
             handle_update_position(request, context)
         }
 
+        IpcCommand::CompositionTerminated => {
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽。
+            handle_composition_terminated(request.session_id)
+        }
+
+        IpcCommand::TogglePanel => {
+            // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽。
+            handle_toggle_panel(request.session_id, window)
+        }
+
         IpcCommand::ShutdownServer => {
             // 已在拿锁之前处理（见函数开头的预分发）；保留此分支只为让 match 穷尽，
             // 两边共用同一实现，避免以后改一处漏一处。
@@ -1347,12 +1410,11 @@ fn process_request(
         }
 
         IpcCommand::ToggleAsciiMode => {
-            tracing::info!("ToggleAsciiMode requested");
             // 计算器组的是自己的串：切换中英会重建 rime 状态，缓冲必须一起清。
             crate::calculator::reset("ToggleAsciiMode");
             let current = eng.is_ascii_mode();
             let new_mode = !current;
-            tracing::info!("  -> current={}, setting to {}", current, new_mode);
+            tracing::debug!("ToggleAsciiMode: {} -> {}", current, new_mode);
 
             // Check if we were composing before the switch
             let was_composing = eng.is_composing();
@@ -1364,7 +1426,7 @@ fn process_request(
 
             // Clear composition in the engine
             if was_composing {
-                tracing::info!("  -> clearing composition before switch");
+                tracing::trace!("  -> clearing composition before switch");
                 eng.clear_composition();
             }
 
@@ -1379,11 +1441,7 @@ fn process_request(
             // When switching to Chinese mode or no input, just clear the composition
             let ctx = if new_mode && !input_text.is_empty() {
                 // Switching to ASCII mode: commit the input code
-                tracing::info!(
-                    "  -> commit_code: committing '{}' before switch to ASCII",
-                    input_text
-                );
-                tracing::info!(">>> COMMIT_TO_SCREEN (toggle): '{}'", input_text);
+                tracing::debug!(">>> COMMIT_TO_SCREEN (toggle): '{}'", input_text);
                 Some(winxime_ipc::Context {
                     preedit: winxime_ipc::Text { str: String::new() },
                     commit: Some(input_text),
@@ -1391,7 +1449,7 @@ fn process_request(
                 })
             } else if was_composing {
                 // Was composing but not committing: indicate composition should be cleared
-                tracing::info!("  -> clearing composition in TSF (no commit)");
+                tracing::trace!("  -> clearing composition in TSF (no commit)");
                 Some(winxime_ipc::Context {
                     preedit: winxime_ipc::Text { str: String::new() },
                     commit: None,
@@ -1544,7 +1602,7 @@ fn process_request(
         }
 
         IpcCommand::GetSchemaList => {
-            tracing::info!("GetSchemaList requested");
+            tracing::debug!("GetSchemaList requested");
             let schemas = eng.get_schema_list();
             let schema_list = schemas
                 .iter()
@@ -1561,7 +1619,6 @@ fn process_request(
         }
 
         IpcCommand::SelectSchema => {
-            tracing::info!("SelectSchema requested");
             // 方案变了，「`=` 是否被方案占用」的检测结果作废。
             crate::calculator::invalidate_trigger_cache();
             let schema_id = match &request.data {
@@ -1571,14 +1628,13 @@ fn process_request(
 
             match schema_id {
                 Some(id) => {
-                    tracing::info!("  -> selecting schema: {}", id);
                     if eng.select_schema(&id) {
                         // 选中记录由 librime 写进 rime 用户目录 user.yaml
                         // （var/previously_selected_schema），无需另行持久化。
                         // 同时打印**引擎实际报的**方案：用户报「设置里又回到别的方案」时，
                         // 这一行能直接分辨是引擎没切过去、还是设置页取错了值。
-                        tracing::info!(
-                            "  -> schema selected successfully: requested={}, engine={:?}",
+                        tracing::debug!(
+                            "schema selected: requested={}, engine={:?}",
                             id,
                             eng.get_current_schema()
                         );
@@ -1590,8 +1646,8 @@ fn process_request(
                         // 拒绝的原因几乎总是「方案未部署」（build/ 无产物）：选进
                         // 未部署方案会得到死会话（所有按键不组词），宁拒不选。
                         // 设置端收到失败后会走「写入方案列表 + 部署」的持久化路径。
-                        tracing::info!(
-                            "  -> schema selection failed: {} 未部署或不存在 (engine={:?})",
+                        tracing::warn!(
+                            "schema selection failed: {} 未部署或不存在 (engine={:?})",
                             id,
                             eng.get_current_schema()
                         );
@@ -1611,46 +1667,38 @@ fn process_request(
         }
 
         IpcCommand::ShowRoot => {
-            tracing::info!("ShowRoot requested");
-            tracing::info!("  -> request.data type: {:?}", request.data);
             let letter = match &request.data {
                 winxime_ipc::IpcRequestData::ShowRoot(c) => Some(*c),
                 _ => None,
             };
 
-            tracing::info!("  -> letter: {:?}", letter);
-
             match letter {
                 Some(c) => {
                     let config = crate::config::get();
                     let schema_id = eng.get_status().map(|s| s.schema_id).unwrap_or_default();
-                    tracing::info!(
-                        "  -> config loaded, schema_id={}, checking root for '{}'",
-                        schema_id,
-                        c
-                    );
                     let root = config.get_root_for_key(&schema_id, c);
-                    tracing::info!("  -> root result: {:?}", root);
-                    if let Some(root) = root {
-                        tracing::info!("  -> showing root for '{}': {}", c, root);
-                        let result = window.show_root(c, &root);
-                        tracing::info!("  -> show_root result: {:?}", result);
-                        IpcResponse {
-                            success: result.is_ok(),
-                            session_id: request.session_id,
-                            status: Some(get_ipc_status(&eng)),
-                            ..IpcResponse::default()
+                    match root {
+                        Some(root) => {
+                            tracing::debug!("show_root: key='{}' root='{}'", c, root);
+                            let result = window.show_root(c, &root);
+                            IpcResponse {
+                                success: result.is_ok(),
+                                session_id: request.session_id,
+                                status: Some(get_ipc_status(&eng)),
+                                ..IpcResponse::default()
+                            }
                         }
-                    } else {
-                        tracing::warn!("  -> no root for key '{}' in schema '{}'", c, schema_id);
-                        IpcResponse {
-                            status: Some(get_ipc_status(&eng)),
-                            ..IpcResponse::fail(request.session_id)
+                        None => {
+                            tracing::warn!("show_root: no root for key '{}' in schema '{}'", c, schema_id);
+                            IpcResponse {
+                                status: Some(get_ipc_status(&eng)),
+                                ..IpcResponse::fail(request.session_id)
+                            }
                         }
                     }
                 }
                 None => {
-                    tracing::info!("  -> no letter provided");
+                    tracing::debug!("show_root: no letter provided");
                     IpcResponse {
                         status: Some(get_ipc_status(&eng)),
                         ..IpcResponse::fail(request.session_id)
@@ -1660,15 +1708,14 @@ fn process_request(
         }
 
         IpcCommand::HideRoot => {
-            tracing::info!("HideRoot requested");
+            tracing::trace!("HideRoot requested");
             window.hide_root();
 
             let ipc_ctx = get_ipc_context(&eng, &None);
             if let Some(ctx) = &ipc_ctx {
                 if !ctx.candidates.candies.is_empty() {
-                    let pos = context.read(|c| (c.caret_x, c.caret_y));
-                    window.show(pos.0, pos.1);
-                    window.update(ctx);
+                    let anchor = context.read(|c| c.caret_anchor());
+                    window.show(anchor, ctx);
                 }
             }
 
@@ -1679,7 +1726,6 @@ fn process_request(
         }
 
         IpcCommand::SelectCandidate => {
-            tracing::info!("SelectCandidate requested");
             let index = match &request.data {
                 winxime_ipc::IpcRequestData::SelectIndex(i) => *i,
                 _ => 0,
@@ -1688,7 +1734,6 @@ fn process_request(
         }
 
         IpcCommand::ChangePage => {
-            tracing::info!("ChangePage requested");
             let backward = match &request.data {
                 winxime_ipc::IpcRequestData::ChangePage(b) => *b,
                 _ => false,
@@ -1759,26 +1804,23 @@ fn select_rime_candidate(
     session_id: u32,
     index: usize,
 ) -> IpcResponse {
-    tracing::info!("  -> selecting candidate at index {}", index);
     let selected = eng.select_candidate(index);
-    tracing::info!("  -> select result: {}", selected);
+    tracing::trace!("select_candidate: index={} selected={}", index, selected);
 
     let commit = eng.get_commit();
-    tracing::info!("  -> commit: {:?}", commit);
 
     let ipc_ctx = get_ipc_context(eng, &commit);
     update_context(eng, context, &commit);
 
     if commit.is_some() {
-        tracing::info!("  -> hide (commit after select)");
+        tracing::trace!("select_candidate: commit, hide");
         window.hide();
     } else if !eng.is_composing() {
-        tracing::info!("  -> hide (not composing after select)");
+        tracing::trace!("select_candidate: not composing, hide");
         window.hide();
     } else if let Some(ctx) = &ipc_ctx {
-        let pos = context.read(|c| (c.caret_x, c.caret_y));
-        window.show(pos.0, pos.1);
-        window.update(ctx);
+        let anchor = context.read(|c| c.caret_anchor());
+        window.show(anchor, ctx);
     }
 
     IpcResponse {
@@ -1805,15 +1847,13 @@ fn change_rime_page(
     session_id: u32,
     backward: bool,
 ) -> IpcResponse {
-    tracing::info!("  -> backward: {}", backward);
     let changed = eng.change_page(backward);
-    tracing::info!("  -> change result: {}", changed);
+    tracing::trace!("change_page: backward={} changed={}", backward, changed);
 
     let ipc_ctx = get_ipc_context(eng, &None);
     if let Some(ctx) = &ipc_ctx {
-        let pos = context.read(|c| (c.caret_x, c.caret_y));
-        window.show(pos.0, pos.1);
-        window.update(ctx);
+        let anchor = context.read(|c| c.caret_anchor());
+        window.show(anchor, ctx);
     }
 
     IpcResponse {
@@ -1859,7 +1899,7 @@ fn handle_paste_trigger(
             ctx.commit_text = body.clone();
         });
         window.hide();
-        tracing::info!("上屏触发键：提交 {} 字", body.chars().count());
+        tracing::trace!("paste trigger: committing {} chars", body.chars().count());
     } else if !released {
         tracing::warn!("上屏触发键到达，但没有待上屏文本（可能已过期或被上一次取走）");
     }
