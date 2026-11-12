@@ -12,11 +12,11 @@
 ## 当前状态
 
 - 版本：0.5.0（`Cargo.toml` 的 `workspace.package.version`；2026-11-11 由 0.4.0 升，本批含候选栏几何 + 面板四项 + 三修复 + 品牌栏移除）
-- 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `f0fa784`；本轮 17 个提交（`1bf9913` 起）已推送。上游 `ximeiorg/XimeYao`（旧名 `ximeiorg/winxime`，同一 HEAD `09ab350`）需走 PR：`tiengming` 对 `ximeiorg/winxime` 无 push 权限（`git push --dry-run upstream main` 返回 403）
+- 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `7ed428f`；上游 `ximeiorg/XimeYao` 的 `main` 已是 `5d8803f`（PR #26 合并），本轮候选栏几何等一批改动另开 PR #28 提交；`tiengming` 对 `ximeiorg/XimeYao` 无 push 权限（只能走 PR）
 - 环境：Windows 11 专业版 10.0.26100 / rustc 1.98.0-nightly / node v24.22.1
 - 基线：build / clippy / test 三项 2026-11-11 实测通过（192 passed、1 ignored、0 failed，含 tsf 6；0 warning 含上游）
 - 依赖：libximecore 合入上游 `04d6ca9`（PR #6：`xime-speech` 摘要字段 + 词典回调 Result），8 个 core 依赖已钉 `rev`；本地 `[patch]` 仍指向 `D:\project\libximecore` 同提交克隆；新仓 libximep2p 克隆在 `D:\project\libximep2p`（HEAD `0865b35`，本项目钉 `b19ecde`）；`winxime-setup` 已开 `pair-page`（`D-008`）；librime 子模块仍 `d71168e`
-- 焦点：候选栏几何与面板四项（U-9/U-11/U-12/U-13/U-14/U-15/U-16）、实机三修复、二级菜单定位、品牌栏移除、U-10 日志治理、U-28 上屏通知——全部编码+机检+**实机确认通过**（2026-11-11）。日志治理后每键收敛为 1 条 trace、无大对象转储；上屏成功不再弹通知。设置页外观两项（候选栏横纵开关、数学计算开关）已在上游 libximecore 落地（`CalculatorConfig` + 外观页两个 switch），随本地 `[patch]` 编译，待上游 PR。P1a、P2、P3a、P3b、P5 已本地提交，全部待实机验证；P3b 的 rev pin 卡在 `b222de2` 尚未推送到 `ximeiorg/libximecore`。
+- 焦点：候选栏几何与面板四项（U-9/U-11/U-12/U-13/U-14/U-15/U-16）、实机三修复、二级菜单定位、品牌栏移除、U-10 日志治理、U-28 上屏通知——全部编码+机检+**实机确认通过**（2026-11-11），已整理成 PR #28 待上游合并。日志治理后每键收敛为 1 条 trace、无大对象转储；上屏成功不再弹通知。设置页外观两项（候选栏横纵开关、数学计算开关）已在上游 libximecore 落地（`CalculatorConfig` + 外观页两个 switch），随本地 `[patch]` 编译，**尚未提交上游**。P1a、P2、P3a、P3b、P5 已本地提交，全部待实机验证；P3b 的 rev pin 卡在 `b222de2` 尚未推送到 `ximeiorg/libximecore`。
 
 ## 进行中
 
@@ -78,6 +78,6 @@
 - U-18~U-27 十条输入功能建议已登记（见未决表批次时机），前置（候选栏实机、U-10 日志治理）已完成，开工前先查证 librime 原生能力。
 - 2026-11-11 实机新遗留：U-29 词典失败文案（本轮已修，待实机）、U-30 模型下载 403 后空目录误判已下载（属上游 `xime-setup`，随上游 PR）。U-31（商店失败提示 4 秒消失）与 U-32（方案装不上/卸不掉）已在上游 `libximecore` 修好并提交 PR #7（待合并），实机复核待用户（`D-011`）。
 - U-10 剩余项：绘制重建与 506ms 离群值随后单独一轮；`DECISIONS.md` 2026-09-30 条「每键重读三份 yaml」的说法已过时（日志治理本身已实机通过并从未决表移除）。
-- 已开 PR：`ximeiorg/XimeYao#26`（草稿，`tiengming:main` → `main`）；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
+- 已开 PR：`ximeiorg/XimeYao#28`（`tiengming:feat/candidate-geometry-and-dict-msgs` → `main`，候选栏几何与面板四项 + U-10 日志治理 + U-28 上屏通知 + U-29 词典文案 + 版本 0.5.0；**按约定不含 docs/**，证据档案只留本地）；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再钉 `rev`，并用真实模型包走一次下载。
 - 本机构建先设 `CC=CXX=clang-cl` 与 LLVM `PATH`，再跑 `cargo build --quiet`；P2P 实机步骤见 [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) 末节。
