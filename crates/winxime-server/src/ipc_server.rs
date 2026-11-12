@@ -1138,22 +1138,20 @@ fn handle_dict_command(
                 _ => None,
             };
             let result = match dict {
-                Some(name) => librime::backup_user_dict(&name).map(|_| 0),
-                None => Err(librime::error::Error::InvalidUtf8),
+                Some(name) => librime::backup_user_dict(&name)
+                    .map(|_| 0)
+                    .map_err(|e| dict_op_reason("备份用户词典失败", e)),
+                None => Err("缺少词典名".to_string()),
             };
-            let success = result.is_ok();
-            IpcResponse {
-                success,
-                session_id: request.session_id,
-                dict_response: result.ok().map(|count| winxime_ipc::DictResponse {
-                dicts: Vec::new(),
-                count,
-                sync_dir: String::new(),
-                entries: Vec::new(),
-                total: 0,
-                ..Default::default()
-            }),
-                ..IpcResponse::default()
+            match result {
+                Ok(count) => IpcResponse {
+                    dict_response: Some(winxime_ipc::DictResponse {
+                        count,
+                        ..Default::default()
+                    }),
+                    ..IpcResponse::ok(request.session_id)
+                },
+                Err(reason) => dict_error(request.session_id, reason),
             }
         }
 
@@ -1169,7 +1167,10 @@ fn handle_dict_command(
             match crate::dict_paths::validate_input_path(&raw, user_data_dir) {
                 Ok(path) => match librime::restore_user_dict(&path.to_string_lossy()) {
                     Ok(()) => IpcResponse::ok(request.session_id),
-                    Err(e) => dict_error(request.session_id, format!("恢复用户词典失败：{e:?}")),
+                    Err(e) => dict_error(
+                        request.session_id,
+                        dict_op_reason("恢复用户词典失败", e),
+                    ),
                 },
                 Err(reason) => {
                     tracing::warn!("RestoreUserDict 被拒：{reason}");
@@ -1201,7 +1202,7 @@ fn handle_dict_command(
                 },
                 Err(e) => {
                     let _ = std::fs::remove_file(&path);
-                    dict_error(request.session_id, format!("导出用户词典失败：{e:?}"))
+                    dict_error(request.session_id, dict_op_reason("导出用户词典失败", e))
                 }
             }
         }
@@ -1224,7 +1225,10 @@ fn handle_dict_command(
                         }),
                         ..IpcResponse::ok(request.session_id)
                     },
-                    Err(e) => dict_error(request.session_id, format!("导入用户词典失败：{e:?}")),
+                    Err(e) => dict_error(
+                        request.session_id,
+                        dict_op_reason("导入用户词典失败", e),
+                    ),
                 },
                 Err(reason) => {
                     tracing::warn!("ImportUserDict 被拒：{reason}");
@@ -1246,6 +1250,28 @@ fn dict_error(session_id: u32, reason: impl Into<String>) -> IpcResponse {
         }),
         ..IpcResponse::fail(session_id)
     }
+}
+
+/// librime 词典操作失败 → 用户可读文案（发生了什么 / 为什么 / 下一步）。
+///
+/// 此前直接 `{e:?}` 把枚举名打给用户（实测出现「导出用户词典失败：ExportUserDict」）；
+/// 现在 `why` 用人话说原因，末尾附 Display 原文供排查。
+fn dict_op_reason(op: &str, e: librime::error::Error) -> String {
+    let why = match &e {
+        librime::error::Error::ApiNotInitialized => "输入法引擎尚未初始化完成",
+        librime::error::Error::FunctionNotAvailable(name) => {
+            return format!("{op}：当前 librime 版本未提供该功能（{name}）。请升级输入法后再试。");
+        }
+        librime::error::Error::ExportUserDict
+        | librime::error::Error::BackupUserDict
+        | librime::error::Error::RestoreUserDict
+        | librime::error::Error::ImportUserDict => "引擎执行词库读写失败，词库可能正被占用或文件无法写入",
+        librime::error::Error::InvalidUtf8 | librime::error::Error::NulByte(_) => {
+            return format!("{op}：词典名或路径含无法处理的字符。请重命名后重试。（{e}）");
+        }
+        _ => "引擎返回失败",
+    };
+    format!("{op}：{why}。请停止输入后重试；若反复出现，请重启输入法后再试。（{e}）")
 }
 
 fn process_request(
@@ -1325,7 +1351,25 @@ fn process_request(
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             tracing::info!("Engine lock would block, returning error response");
-            return IpcResponse::fail(request.session_id);
+            // 词典命令走这里说明引擎正忙（同步用户资料/重载配置/部署）。给设置页
+            // 带回可读原因，而不是裸 fail 让界面显示「操作失败」（U-29 实测教训）。
+            return if matches!(
+                request.command,
+                IpcCommand::ListUserDicts
+                    | IpcCommand::ListDictEntries
+                    | IpcCommand::ImportDictEntry
+                    | IpcCommand::BackupUserDict
+                    | IpcCommand::RestoreUserDict
+                    | IpcCommand::ExportUserDict
+                    | IpcCommand::ImportUserDict
+            ) {
+                dict_error(
+                    request.session_id,
+                    "输入法正在处理其它任务（如同步词库或部署方案），暂时无法执行词典操作。请稍等几秒后重试。",
+                )
+            } else {
+                IpcResponse::fail(request.session_id)
+            };
         }
     };
 
