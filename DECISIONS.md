@@ -3,6 +3,17 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-011 方案包 id 归一化，通知与页面文案同源
+
+- 日期：2026-11-12
+- 状态：生效（上游 PR #7 已提交待合并；实机验证待用户执行）
+- 背景：用户反馈市场方案「装不上、卸不掉」，且系统通知与设置页文案不一致。日志显示三处根因：① 缓存目录按索引 id 命名，但「已下载」页把**目录名**当方案 id 返回，界面 id ≠ 索引 id ≠ 注册表 key（本机同时存在 `Moqi Wan Flypymo` / `Moqi Wan Flypymo 1.2.0` / `moqi_wan_flypymo` 三种历史目录名），卸载时按目录名查注册表就报「方案包未安装」，而文件其实已删；② `local`（用户自放的兜底记录）被当作冲突占用方，`rime-wanxiang` 因 README.md 冲突装不上；③ 成功只弹 WinRT toast、失败是 4 秒后消失的红字，两套文案两套生命周期，用户错过即「无提示」（U-31）。
+- 决策：① 引入方案包 id 归一化口径——`normalize_package_id`（忽略大小写、分隔符与版本号尾巴）+ `same_package_id`（同包判定）+ `resolve_package_key`（注册表别名查找）；索引 id 为唯一规范 id，历史目录名按归一匹配回索引 id，缓存目录定位统一走 `package_cache_dir`。② `local` 与内置方案包都不算冲突方，安装冲突只列真正占用文件的第三方包。③ 通知与页面文案同源：新增 `MarketNotice { title, body }`，在后台任务里一次性构造，toast 与页面 `install_message` 用同一份文本；失败文案按「发生了什么 / 为什么 / 下一步」组织。④ 方案结果不再自动消失（`expire_install_messages` 只回收模型/插件消息）。⑤ 下载临时文件名由 `x.zip.part.part.<pid>` 改回 `x.zip.part.<pid>`，并在索引刷新时清理遗留 `.part`。
+- 理由：id 是贯穿「索引 → 缓存目录 → 注册表 → 界面」的唯一句柄，任何一处用另一种写法都会表现为「装不上/卸不掉」；归一化放在 `xime-config`（注册表的唯一所有者）比在 UI 层打补丁更彻底。通知与文案同源是因为二者本应描述同一件事，现状是同一件事写了两遍、还各有生命周期，所以「不一致」不是文案问题而是结构问题。冲突判定收紧，是因为「一个 rime 目录只留一个包」的真实约束是**文件重叠**，不是「注册表里有别的包」。
+- 影响与代价：`xime-config` 公开面新增三个函数（`normalize_package_id` / `same_package_id` / `resolve_package_key`）；`xime-setup` 的 `MarketTaskResult` 三个变体改为携带文案，所有匹配处同步改；界面多了「安装/卸载」按钮与人类可读包名。代价是历史遗留的三种目录名要在扫描时归一，索引未加载时只能退回目录名。为便于自动化验证脚本，上游另开放了一组只读诊断入口（`set_market_schema_index` / `market_schema_display_name` / `canonical_schema_id` / `package_cache_dir` / `cleanup_stale_download_parts` / `downloaded_schema_ids` / `schema_install_conflict` / `set_market_task_result`，`MarketNotice` 字段改为 pub），它们只读或仅供注入状态，不改变业务路径。
+- 验证方式：除单元用例外，另写一次性探针脚本 `target/tmp/schema-probe/`（数据目录重定向到临时目录，不触碰真实 `%APPDATA%`，不调用 `deploy_all()`），18 项断言覆盖 id 归一、缓存目录解析、别名卸载、`local` 不阻塞、冲突过滤、页面与 toast 同文、方案结果不自动消失、失败文案含「下一步」等，全部通过；证据见 `docs/verify/2026-11-12-schema-package-install-notify.md` 第 7 节。
+- 遗留：上游改动已拆分提交为 `ximeiorg/libximecore` PR #7（`feat/schema-package-id-and-notify`，提交 `c813f89` + `40c4327`），待上游合并；顺带把 aes-gcm 弃用与「不带 features 编译 `xime-setup-lib` 失败」分别开成 PR #8、#9（后者即 `D-008` 遗留里提到的 `pair-page` 组合缺口）；`xime-config` 两个预存失败用例（`calculator::tests::parses_explicit_false_only`、`schema_manifest::tests::refresh_builtin_tracks_scheme_files_and_skips_user_data`）与本次改动无关，未擅自修；实机验证待用户执行。
+
 ## D-010 依赖钉到 libximecore 合并提交，版本升 0.4.0
 
 - 日期：2026-11-10
@@ -31,7 +42,7 @@
 - 决策：① 给 `winxime-setup` 的 `xime-setup-lib` 依赖加 `pair-page`（与 `clipboard-page` 同开）；② 不另钉 `rev`，跟随 `libximecore` 已锁的 `libximep2p` rev `b19ecde`；③ 不改上游 `xime-p2p` / `xime-setup` 代码，宿主要补的只有 `AppMetadata` 字段。
 - 理由：`pair-page` 与 `clipboard-page` 必须同开——`pair-page` 的匹配臂引用 `Message::SyncModeChanged`，而这个变体与 `sync_plugin` 字段由 `clipboard-page` 门控（`xime-setup` 的 feature 组合缺口）。XimeYao 本来就要剪贴板页，同开无额外成本。跟上游 `rev` 是因为 `b19ecde` 是 `libximecore` 自己测过的组合，宿主擅自换 rev 会把两仓的测试结论作废。
 - 影响与代价：构建期要从 GitHub 拉 `libximep2p`，离线环境会失败（`Cargo.lock` 已锁 `b19ecde`，首次要联网）；设置页多一个侧栏页，用户数据目录同级多一个 `p2p/`（身份与配对表）；安装包体积略增。
-- 遗留：`pair-page` 单独开启仍编不过（`xime-setup` 的 `app.rs` 里「配对消息」的匹配臂没加与变体一致的 `cfg` 门控，属上游问题）；上游 `b19ecde` 落后 `libximep2p` 四个提交（含协议 v2），是否升级要上游决定；配对、互传的运行时行为待两台设备实机。
+- 遗留：`pair-page` 单独开启仍编不过（`xime-setup` 的 `app.rs` 里「配对消息」的匹配臂没加与变体一致的 `cfg` 门控）——已在上游 PR #9 修复，待合并；上游 `b19ecde` 落后 `libximep2p` 四个提交（含协议 v2），是否升级要上游决定；配对、互传的运行时行为待两台设备实机。
 
 ## D-007 词典导出路径由服务端生成，导入/恢复只收白名单内文件
 
