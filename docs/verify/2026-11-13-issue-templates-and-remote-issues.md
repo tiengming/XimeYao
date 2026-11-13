@@ -10,7 +10,7 @@
 | 本仓 | XimeYao 0.5.0，`main`（`D:\project\XimeYao`） |
 | 上游 | `ximeiorg/XimeYao` `main` = `3473fef`（PR #28 已合并）；本机账号 `tiengming` 对上游无 push 权限，走 PR |
 | 本轮提交 | fork `tiengming/XimeYao`：`main` → `fd6747b`（本地文档登记）；`feat/issue-templates` → `d9c7570`（仅 `.github/ISSUE_TEMPLATE/` 四份文件） |
-| 上游 PR | `ximeiorg/XimeYao#31`（`tiengming:feat/issue-templates` → `main`），2026-11-13 开；Docs job 已 success，Build 观察中 |
+| 上游 PR | `ximeiorg/XimeYao#31`（`tiengming:feat/issue-templates` → `main`），2026-11-13 开、Docs + Build 双绿后**已合并为 `cb111f4`**；模板已在仓库 Issues → New issue 页生效（用户截图确认：功能建议 / 使用问题 / Blank issue / 两个 contact link 均出现） |
 | 取数方式 | GitHub REST API（`api.github.com`），经本机代理 `http://127.0.0.1:10809`，脚本 `target/tmp/gh-fetch.mjs`（取数）与 `target/tmp/gh-api.mjs`（带方法/头/体，用于开 PR 与查 CI）（均为一次性产物） |
 | 工具链 | node v24.22.1；Python（仅用于 YAML 解析自检） |
 
@@ -51,14 +51,14 @@
 | Windows 11 | `node scripts/refcheck.mjs` | `refcheck: 通过（N 个文件）` | 章节引用与 D-nnn 引用 |
 | Windows 11 | `node target/tmp/gh-fetch.mjs "https://api.github.com/repos/ximeiorg/XimeYao/issues?state=all&per_page=100"` | `200 113568`，解析出 issues=5 / prs=25 | 远程 issue 快照 |
 | Windows 11 | `node target/tmp/gh-api.mjs POST "https://api.github.com/repos/ximeiorg/XimeYao/pulls" target/tmp/pr-resp.json target/tmp/pr-body.json` | `201 16284`，PR 编号 31，head `tiengming:feat/issue-templates` @ `d9c7570`，base `main` @ `3473fef`，additions=254 / changed_files=4 | 上游 PR 已开 |
-| Windows 11 | `node target/tmp/gh-api.mjs GET ".../commits/d9c7570.../check-runs"` | `200 6090`；`Docs` = completed/success，`Build` = in_progress | PR #31 的 CI 状态 |
+| Windows 11 | `node target/tmp/gh-api.mjs GET ".../commits/d9c7570.../check-runs"` | `200 6111`；`Docs` = completed/success，`Build` = completed/success | PR #31 的 CI 状态 |
+| GitHub 网页 | 打开 `ximeiorg/XimeYao` → Issues → New issue | 出现「功能建议（Feature）」「使用问题（Question）」「Blank issue」与两个 contact link（用户截图） | 模板选择器渲染 |
 
 ## 5. 未验证项
 
-- 模板在 GitHub 网页上的实际渲染效果（表单是否按预期出现、下拉是否可提交）——需 PR #31 合并后在仓库页面人工确认。
+- 模板在 GitHub 网页上的渲染已由用户截图确认（模板选择器可用）；**三个表单各自的必填项校验与下拉提交**尚未逐个走查。
 - 远程 issue 的行为根因（U-33 ~ U-35）尚未在本机复现，表中「处置」列写的是**假设方向**，不是已证结论。
 - #27 附带的两张截图（`github.com/user-attachments`）本轮未下载细看。
-- PR #31 的 Build job 观察时仍在 `in_progress`，未看到最终结论。
 
 ## 6. 关联
 
