@@ -4,15 +4,15 @@
 
 ## 接手指南
 
-- 当前阶段：候选栏几何与面板四项（U-9/U-11/U-12/U-13/U-14/U-15/U-16）、首轮实机三修复、品牌栏移除、二级菜单定位修复、U-10 日志治理、U-28 上屏通知修复**全部实机确认通过**（2026-11-11 用户复测）；版本推进 0.5.0；仓库地址与关于页入口已统一到 `ximeiorg/XimeYao`。2026-11-12 又修好「市场方案装不上/卸不掉」（U-32）与「商店失败提示 4 秒消失、通知与页面文案不一致」（U-31），改动在上游 libximecore，已拆成 PR #7 提交（待合并），实机复核待用户。
-- 下一个功能点：输入功能批次第一批（U-25 简繁转换 → U-18 整句开关 → U-23 反查，schema 配置批；见未决表时机）或 U-8/U-17 关于页（等用户文案）。设置页外观两项已在上游 libximecore 落地，待上游 PR。开工前按 `WORKFLOW.md §2` 写 S0。
+- 当前阶段：候选栏几何与面板四项（U-9/U-11/U-12/U-13/U-14/U-15/U-16）、首轮实机三修复、品牌栏移除、二级菜单定位修复、U-10 日志治理、U-28 上屏通知修复**全部实机确认通过**（2026-11-11 用户复测）；版本推进 0.5.0；上游 PR #28 已合并（`3473fef`）。2026-11-12 又修好「市场方案装不上/卸不掉」（U-32）与「商店失败提示 4 秒消失、通知与页面文案不一致」（U-31），改动在上游 libximecore，已拆成 PR #7 提交（待合并），实机复核待用户。2026-11-13 新增远程 issue 表单模板（缺陷/功能建议/提问），并把远程 5 个 issue 登记为 U-33~U-37。
+- 下一个功能点：输入功能批次第一批（U-25 简繁转换 → U-18 整句开关 → U-23 反查，schema 配置批；见未决表时机）或 U-8/U-17 关于页（等用户文案）。设置页外观两项已在上游 libximecore 落地，待上游 PR。远程 issue 的取证（U-33~U-35）可插队。开工前按 `WORKFLOW.md §2` 写 S0。
 - 阻断项：本机 cargo 直接编译 C 依赖会报 `D8050`，构建时需 `CC=CXX=C:\Program Files\LLVM\bin\clang-cl.exe` 且 `PATH` 前置 LLVM（见审计文档附录）；CI 不受影响。上游 libximecore 必须用 `cargo +nightly-2026-07-03`（stable 1.89 低于 `ordered-float` 1.90 / `rfd` 1.92 要求）。
 - 30 秒读法：本文件 → `DECISIONS.md` 最近 3 条 → `WORKFLOW.md §1`。
 
 ## 当前状态
 
 - 版本：0.5.0（`Cargo.toml` 的 `workspace.package.version`；2026-11-11 由 0.4.0 升，本批含候选栏几何 + 面板四项 + 三修复 + 品牌栏移除）
-- 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `7ed428f`；上游 `ximeiorg/XimeYao` 的 `main` 已是 `5d8803f`（PR #26 合并），本轮候选栏几何等一批改动另开 PR #28 提交；`tiengming` 对 `ximeiorg/XimeYao` 无 push 权限（只能走 PR）
+- 分支：`main` 与 `origin/main`（fork `tiengming/XimeYao`）同步于 `a2e5604`；上游 `ximeiorg/XimeYao` 的 `main` 已是 `3473fef`（PR #28 已合并，含候选栏几何等一批与版本 0.5.0）；`tiengming` 对 `ximeiorg/XimeYao` 无 push 权限（只能走 PR）
 - 环境：Windows 11 专业版 10.0.26100 / rustc 1.98.0-nightly / node v24.22.1
 - 基线：build / clippy / test 三项 2026-11-11 实测通过（192 passed、1 ignored、0 failed，含 tsf 6；0 warning 含上游）
 - 依赖：libximecore 合入上游 `04d6ca9`（PR #6：`xime-speech` 摘要字段 + 词典回调 Result），8 个 core 依赖已钉 `rev`；本地 `[patch]` 仍指向 `D:\project\libximecore` 同提交克隆；新仓 libximep2p 克隆在 `D:\project\libximep2p`（HEAD `0865b35`，本项目钉 `b19ecde`）；`winxime-setup` 已开 `pair-page`（`D-008`）；librime 子模块仍 `d71168e`
@@ -23,6 +23,7 @@
 - 2026-11-12 方案包安装/卸载 + 通知-UI 统一（U-32 / U-31）：代码与机检已完成，**脚本探针 18 项断言全通过**（`target/tmp/schema-probe/`，一次性产物），改动主体在上游 `libximecore`（`xime-config` + `xime-setup`），本仓经 `[patch]` 引入；**上游 PR #7 已提交（待合并）、实机验证待用户**；顺带把 aes-gcm 弃用与无 feature 编译失败也各开一个 PR（#8 / #9）。见 [2026-11-12-schema-package-install-notify.md](docs/verify/2026-11-12-schema-package-install-notify.md)。
 - 候选栏批次（几何+面板四项+三修复+二级菜单定位+品牌栏移除）与 U-10 日志治理、U-28 上屏通知已于 2026-11-11 全部实机确认通过。
 - 构建警告已清零（上游 aes-gcm deprecated ×2 改 `Nonce` copy 填充、TSF 链接 LNK4104 ×4 以 `#![allow(linker_messages)]` 说明缘由关闭）；上游 `xime-plugin/src/cipher.rs` 改动已随上游 PR #8 提交。
+- 2026-11-13 issue 模板与远程 issue 登记（`D-012`）：`.github/ISSUE_TEMPLATE/` 四份文件已写好（`bug_report.yml` / `feature_request.yml` / `question.yml` / `config.yml`），YAML 解析自检通过；远程 5 个 issue 已映射为 U-33~U-37 进未决表；决策与证据档案已写。待走 PR 提交上游。
 
 ## 已完成
 
@@ -56,6 +57,11 @@
 | U-30 | 模型下载 403 失败后留空目录，且「已下载」判定只查目录存在（`scan_dir_ids`），空目录被判为已下载、之后安装永远失败无处自愈（模型侧未对齐方案侧的压缩包过滤） | 已登记 | 上游 `xime-setup`：`get_cached_model_ids` 改为过滤目录内确有文件的项（对齐 `downloaded_schema_ids` 的做法）；403 源头是 modelscope CDN auth_key 过期，属模型源问题 | 随上游 PR 一并修；模型源链接由模型发布方更新 |
 | U-32 | 市场方案「装不上 / 卸不掉」：缓存目录名（历史三种写法）被当方案 id，界面 id ≠ 索引 id ≠ 注册表 key ⇒ 卸载报「方案包未安装」（文件其实已删）；`local` 被当冲突占用方 ⇒ `rime-wanxiang` 因 README.md 冲突装不上；冲突预检把所有其它包都算冲突 ⇒ 装第二个市场包必被要求卸载第一个 | 已修（上游 `xime-config` + `xime-setup`，PR #7 已提交待合并 + 实机） | id 归一化（`normalize_package_id` / `same_package_id` / `resolve_package_key`）+ 缓存目录解析层 `package_cache_dir`；`local` 与内置包不算冲突；冲突只列真正占用文件的第三方包（`D-011`）。脚本探针 18 项断言全通过（含遗留目录名归一、别名卸载、local 不阻塞） | 等上游合并 #7；实机按档案第 9 节六步复核 |
 | U-31 | 商店下载失败提示 4 秒自动消失（`expire_install_messages`），用户错过即「无提示」（墨奇方案下载实测无提示） | 已修（上游 `xime-setup`，PR #7 已提交待合并 + 实机） | `expire_install_messages` 只回收模型/插件消息，方案结果常驻页面；通知与页面文案改由同一处 `MarketNotice` 构造（`D-011`）。脚本探针已验证页面文案与 toast 同文、方案结果不自动消失、失败文案含「下一步」 | 等上游合并 #7；实机确认失败提示不消失且与系统通知同文 |
+| U-33 | 远程 #30「数字选字问题」（ztff，2026-11-12）：数字键应只在小键盘区做混合输入，字母区数字应选候选字词；本输入法行为相反 | 已登记（远程 #30） | 假设方向（未复现）：内置计算器「数字开头影子缓冲」默认开启（`calculator::auto_detect_enabled` 默认 true），组词串为空时按数字被吞进算式缓冲，候选选字键被抢；字母区与小键盘区未做区分 | 先在 issue 下追问「哪个应用、按哪个数字键、期望选中第几个」；本机复现后按 `WORKFLOW.md §4` 三档处置（疑似需按「是否组词中」区分数字键归属，动手前写 `D-nnn`） |
+| U-34 | 远程 #29「万象拼音不能切双拼」（ztff，2026-11-12）：输入 `/zrm` 无切换选项；改 `wanxiang.custom.yaml` 重新部署后无效果 | 已登记（远程 #29） | 假设方向（未复现）：方案 `switches` 的多选一 option 未在托盘菜单暴露（`schema_switches.rs` 只解析有 `states` 的项）；`/zrm` 选方案属 rime 侧能力，与本仓托管逻辑是否相关待查 | 追问用户所用万象版本与 `/zrm` 期望行为；本机用万象方案复现「托盘菜单是否列出双拼选项」，确认是引擎不支持还是菜单没暴露 |
+| U-35 | 远程 #27「0.4 版本的万象无法上屏」（illidanplus，2026-11-11）：已打出候选，按空格变成码后加 1，按回车把源码上屏，只能鼠标点击上屏 | 已登记（远程 #27） | 假设方向（未复现）：空格与回车在候选态的提交路径与鼠标点选不一致（点选走 `ui/view.rs` 的选中→提交，键盘路径走 librime 提交 + 计算器影子缓冲回放） | 已有维护者回复要求补「预期 / 动作 / 实际」；等用户补充后本机用万象方案复现（0.5.0 与 0.4.0 行为可能已不同，需先确认版本） |
+| U-36 | 远程 #12「还不能正常用吗」（dadadafafafa，2026-09-08）：询问何时出正式版 | 已登记（远程 #12） | 非缺陷，是发布节奏提问；已有维护者回复「等待ing」 | 版本推进到 0.6.0 或发版公告时回帖说明计划；不单独立功能点 |
+| U-37 | 远程 #11「好期待呀，快出一版我们用用吧！」（chenxin0397，2026-08-27） | 已登记（远程 #11） | 期待类反馈，无具体问题 | 与 U-36 合并到同一次发布答复 |
 
 输入功能批次（U-18~U-27 十条用户建议）的前置（候选栏几何实机确认、U-10 日志治理）均已完成，按上表时机分批：schema 配置批（U-18/U-23/U-25）→ 码表与词库批（U-19/U-22）→ 候选栏交互批（U-26/U-27）→ 快捷键批（U-20 随上游 PR）。开工前每条先查证 librime 原生能力，避免自研重复造轮子。
 
@@ -71,6 +77,7 @@
 | 2026-11-11 | U-5a IPC 管道 ACL（P1a）实机验证补记 | [2026-11-09-ipc-acl.md](docs/verify/2026-11-09-ipc-acl.md) | **通过**（server.log 三次启动均含「用户 SID + SYSTEM」ACL 行；TSF 打字与设置页词典列表均走新管道正常） |
 | 2026-11-11 | U-29 词典操作失败文案修复（`dict_op_reason` 人话 + 引擎锁占用提示 + 备份失败补 error） | [2026-11-11-dict-error-messages.md](docs/verify/2026-11-11-dict-error-messages.md) | 机检通过（192 passed、0 warning）；**自动验证通过**（探测脚本六条命令：两处人话文案、三处 dict_paths 拒绝回归、成功路径正常） |
 | 2026-11-12 | 方案包安装/卸载失败与通知-UI 不统一（U-32 + U-31） | [2026-11-12-schema-package-install-notify.md](docs/verify/2026-11-12-schema-package-install-notify.md) | 机检通过（本仓 build/clippy 0 warning/test 全绿；上游 xime-setup-lib 62 passed、xime-config 44 passed + 2 预存失败）；**脚本探针 18 项断言全通过**；**上游 PR #7/#8/#9 已提交**；实机待用户按档案第 9 节六步复核 |
+| 2026-11-13 | 远程 issue 表单模板 + 远程 5 个 issue 本地登记（U-33~U-37） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) | 四份 YAML 解析通过；doccheck/refcheck 双绿；远程快照 issues=5 / prs=25；**模板网页渲染效果与 U-33~U-35 根因未验证** |
 
 ## 下一步
 
@@ -78,6 +85,7 @@
 - U-18~U-27 十条输入功能建议已登记（见未决表批次时机），前置（候选栏实机、U-10 日志治理）已完成，开工前先查证 librime 原生能力。
 - 2026-11-11 实机新遗留：U-29 词典失败文案（本轮已修，待实机）、U-30 模型下载 403 后空目录误判已下载（属上游 `xime-setup`，随上游 PR）。U-31（商店失败提示 4 秒消失）与 U-32（方案装不上/卸不掉）已在上游 `libximecore` 修好并提交 PR #7（待合并），实机复核待用户（`D-011`）。
 - U-10 剩余项：绘制重建与 506ms 离群值随后单独一轮；`DECISIONS.md` 2026-09-30 条「每键重读三份 yaml」的说法已过时（日志治理本身已实机通过并从未决表移除）。
-- 已开 PR：`ximeiorg/XimeYao#28`（`tiengming:feat/candidate-geometry-and-dict-msgs` → `main`，候选栏几何与面板四项 + U-10 日志治理 + U-28 上屏通知 + U-29 词典文案 + 版本 0.5.0；**按约定不含 docs/**，证据档案只留本地）；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
+- 已开 PR：`ximeiorg/XimeYao#28`（`tiengming:feat/candidate-geometry-and-dict-msgs` → `main`，候选栏几何与面板四项 + U-10 日志治理 + U-28 上屏通知 + U-29 词典文案 + 版本 0.5.0；**按约定不含 docs/**，证据档案只留本地）**已于 2026-11-13 合并为 `3473fef`**；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
+- 本轮待办：把 `.github/ISSUE_TEMPLATE/` 四份模板 + `D-012` + `PROGRESS.md` 未决表 U-33~U-37 走 PR 提交上游（`ximeiorg/XimeYao`），合并后到仓库「Issues → New issue」页人工确认三个表单的渲染与下拉可提交；再按 U-33→U-34→U-35 顺序在远程 issue 下追问缺项并本机取证。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再钉 `rev`，并用真实模型包走一次下载。
 - 本机构建先设 `CC=CXX=clang-cl` 与 LLVM `PATH`，再跑 `cargo build --quiet`；P2P 实机步骤见 [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) 末节。
