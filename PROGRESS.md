@@ -23,7 +23,7 @@
 - 2026-11-12 方案包安装/卸载 + 通知-UI 统一（U-32 / U-31）：代码与机检已完成，**脚本探针 18 项断言全通过**（`target/tmp/schema-probe/`，一次性产物），改动主体在上游 `libximecore`（`xime-config` + `xime-setup`），本仓经 `[patch]` 引入；**上游 PR #7 已提交（待合并）、实机验证待用户**；顺带把 aes-gcm 弃用与无 feature 编译失败也各开一个 PR（#8 / #9）。见 [2026-11-12-schema-package-install-notify.md](docs/verify/2026-11-12-schema-package-install-notify.md)。
 - 候选栏批次（几何+面板四项+三修复+二级菜单定位+品牌栏移除）与 U-10 日志治理、U-28 上屏通知已于 2026-11-11 全部实机确认通过。
 - 构建警告已清零（上游 aes-gcm deprecated ×2 改 `Nonce` copy 填充、TSF 链接 LNK4104 ×4 以 `#![allow(linker_messages)]` 说明缘由关闭）；上游 `xime-plugin/src/cipher.rs` 改动已随上游 PR #8 提交。
-- 2026-11-13 issue 模板与远程 issue 登记（`D-012`）：`.github/ISSUE_TEMPLATE/` 四份文件已写好（`bug_report.yml` / `feature_request.yml` / `question.yml` / `config.yml`），YAML 解析自检通过；远程 5 个 issue 已映射为 U-33~U-37 进未决表；决策与证据档案已写。待走 PR 提交上游。
+- 2026-11-13 issue 模板与远程 issue 登记（`D-012`）：`.github/ISSUE_TEMPLATE/` 四份文件已写好（`bug_report.yml` / `feature_request.yml` / `question.yml` / `config.yml`），YAML 解析自检通过；远程 5 个 issue 已映射为 U-33~U-37 进未决表；决策与证据档案已写；**上游 PR `ximeiorg/XimeYao#31` 已开（`tiengming:feat/issue-templates` → `main`，Docs job 已绿，Build 待跑完）**。
 
 ## 已完成
 
@@ -86,6 +86,6 @@
 - 2026-11-11 实机新遗留：U-29 词典失败文案（本轮已修，待实机）、U-30 模型下载 403 后空目录误判已下载（属上游 `xime-setup`，随上游 PR）。U-31（商店失败提示 4 秒消失）与 U-32（方案装不上/卸不掉）已在上游 `libximecore` 修好并提交 PR #7（待合并），实机复核待用户（`D-011`）。
 - U-10 剩余项：绘制重建与 506ms 离群值随后单独一轮；`DECISIONS.md` 2026-09-30 条「每键重读三份 yaml」的说法已过时（日志治理本身已实机通过并从未决表移除）。
 - 已开 PR：`ximeiorg/XimeYao#28`（`tiengming:feat/candidate-geometry-and-dict-msgs` → `main`，候选栏几何与面板四项 + U-10 日志治理 + U-28 上屏通知 + U-29 词典文案 + 版本 0.5.0；**按约定不含 docs/**，证据档案只留本地）**已于 2026-11-13 合并为 `3473fef`**；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
-- 本轮待办：把 `.github/ISSUE_TEMPLATE/` 四份模板 + `D-012` + `PROGRESS.md` 未决表 U-33~U-37 走 PR 提交上游（`ximeiorg/XimeYao`），合并后到仓库「Issues → New issue」页人工确认三个表单的渲染与下拉可提交；再按 U-33→U-34→U-35 顺序在远程 issue 下追问缺项并本机取证。
+- 本轮待办：`ximeiorg/XimeYao#31`（issue 表单模板，等上游合并；合并后到仓库「Issues → New issue」页人工确认三个表单的渲染与下拉可提交）；再按 U-33→U-34→U-35 顺序在远程 issue 下追问缺项并本机取证。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再钉 `rev`，并用真实模型包走一次下载。
 - 本机构建先设 `CC=CXX=clang-cl` 与 LLVM `PATH`，再跑 `cargo build --quiet`；P2P 实机步骤见 [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) 末节。
