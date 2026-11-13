@@ -3,6 +3,17 @@
 > 2026-11-09 起启用 `D-nnn` 编号与固定字段（写法见 `WORKFLOW.md §6`）；新条目写在下方、按编号从新到旧。
 > 此前的日期标题条目保持原样、不溯改编号；引用旧条目用日期加标题。
 
+## D-013 issue 表单结构由机检守住，坏表单不许静默消失
+
+- 日期：2026-11-13
+- 状态：生效（上游 PR `ximeiorg/XimeYao#32` 已合并为 `f1f18e3`，CI 双绿；渲染待用户确认）
+- 背景：`D-012` 的三份表单随 PR #31 合并后，用户在 Issues → New issue 页只看到「功能建议」「使用问题」「Blank issue」，**「缺陷反馈（Bug）」整份表单不出现**，而仓库里没有任何报错。根因是 `bug_report.yml` 的 `logs` 字段把 `placeholder:` 写在了 `attributes:` 外面（元素级）；GitHub 的 issue form 是**整份表单一起校验**，任一 body 元素不合法就整份表单被静默丢弃——另外两个表单正常，更像「文件没推上去」，排查绕了不少弯路。
+- 决策：① 把 `placeholder:` 移回 `attributes:` 内；② 新增 `scripts/issueform-check.mjs`，按缩进做结构检查（顶层键白名单 `name`/`description`/`body`/`assignees`/`labels`/`title`/`type`/`projects`；body 元素键白名单 `type`/`id`/`attributes`/`validations`；各元素类型对应的 attributes 必填与允许键；validations 只允许 `required`/`min_length`；id 只能含字母数字与 `-`/`_` 且唯一；label 唯一；`config.yml` 顶层键），**不引第三方 YAML 依赖**，CI 与本机都能直接跑；③ `.github/workflows/ci.yml` 的 `docs` job 增加 `issueform-check` 步骤。
+- 理由：GitHub 对不合法的 issue form 不给任何反馈（页面不显示、仓库无报错），这种「静默失败」只能靠机检兜住，别的地方同理——凡是外部系统只消费不出声的接口，本仓都要自己留一道可执行的校验。检查器不引 YAML 依赖，是因为 `scripts/` 下现有两个机检（`doccheck.mjs`、`refcheck.mjs`）都是零依赖手写解析，再引入 `js-yaml` 会让 CI 多一次依赖安装，也和既有风格不一致。
+- 影响与代价：`scripts/` 多一个文件、CI docs job 多一步（秒级）；手写的缩进解析只覆盖本仓自己写模板时的写法（属性块固定 6 空格缩进、元素键 4 空格），换一种 YAML 排版可能漏检，但对本仓模板够用；真正的官方校验仍以 GitHub 自身为准。
+- 遗留：机检只能证明结构合法，**不能证明 GitHub 会渲染该表单**——「缺陷反馈（Bug）」在 New issue 页出现与否仍需合并后由用户在网页上确认；三个表单各自的必填项校验与下拉提交尚未逐个走查；远程 issue U-33 ~ U-37 的根因仍未本机复现。
+- 验证方式：`node scripts/issueform-check.mjs` 对四份表单通过；对合并前的旧版 `bug_report.yml` 跑同一脚本，报 `第 124 行：body 元素下出现非法键 placeholder`，即原缺陷可被复现（负向测试）；`node scripts/doccheck.mjs` 与 `node scripts/refcheck.mjs` 同批通过；上游 PR #32 的 CI `Docs` 与 `Build` 均 success。证据见 `docs/verify/2026-11-13-issue-templates-and-remote-issues.md` 第 5 节。
+
 ## D-012 远程 issue 走表单模板，本地未决表登记远程编号
 
 - 日期：2026-11-13

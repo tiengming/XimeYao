@@ -54,13 +54,60 @@
 | Windows 11 | `node target/tmp/gh-api.mjs GET ".../commits/d9c7570.../check-runs"` | `200 6111`；`Docs` = completed/success，`Build` = completed/success | PR #31 的 CI 状态 |
 | GitHub 网页 | 打开 `ximeiorg/XimeYao` → Issues → New issue | 出现「功能建议（Feature）」「使用问题（Question）」「Blank issue」与两个 contact link（用户截图） | 模板选择器渲染 |
 
-## 5. 未验证项
+## 5. 缺陷表单缺失：根因与修复（2026-11-13 第二轮）
 
+用户截图（Issues → New issue 页）显示：只有「功能建议（Feature）」「使用问题（Question）」「Blank issue」与两个 contact link，**「缺陷反馈（Bug）」整份表单不出现**，仓库里无任何报错。
+
+### 5.1 根因
+
+`bug_report.yml` 的 `logs` 字段把 `placeholder:` 写在了 `attributes:` **外面**（元素级）：
+
+```yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: |
+        可选。`%APPDATA%\Xime\logs\server.log` 中出问题时间附近的内容。
+    placeholder: |          # ← 错误位置
+      [2026-11-12 10:10:37] ...
+```
+
+GitHub 的 issue form 是**整份表单一起校验**——任一 body 元素不合法，整份表单被静默丢弃：New issue 页不显示、仓库也没有任何提示。另外两份表单正常，更像「文件没推上去」，因此排查绕了不少弯路。
+
+### 5.2 已排除的误判方向
+
+- UTF-8 字节无效：raw.githubusercontent 与分支版本均通过严格 UTF-8 解码。
+- body 元素数量上限：上游 `golang/go` 的 `11-language-change.yml` 有 17 个元素、`nodejs` 有 9 个，均正常；GitHub 文档无 body 元素数上限。
+- 缺 `type: bug` / `title:` 顶层键：schema 允许 `type`；tldraw#8869 那条 `type: Bug` 报错属另一仓库未启用 org issue types。
+- JSON SchemaStore 的 `github-issue-forms.json` 无 `maxItems`/`maxLength` 限制（只有 label `maxLength` 39）。
+- raw.githubusercontent 抓取内容里的 U+FFFD（`输入���容`）是本机抓取脚本分块解码的假象；改用 `api.github.com/repos/.../contents/...?ref=` 取 base64 blob 复核是干净的。**以后取仓库文件一律走 base64 blob 接口。**
+- 未登录访问 `github.com/.../issues/new` 一律返回 "Uh oh! There was an error while loading."（Basic 认证同样），脚本无法当渲染 oracle，只能靠 schema 校验 + 人工核对。
+
+### 5.3 修复与新增机检
+
+- `.github/ISSUE_TEMPLATE/bug_report.yml`：`placeholder:` 移回 `attributes:` 内。
+- 新增 `scripts/issueform-check.mjs`（零第三方依赖，按缩进做结构检查）：顶层键白名单、body 元素键白名单、各元素类型 attributes 必填与允许键、validations 白名单、id 合法性与唯一性、label 唯一性、`config.yml` 顶层键。
+- `.github/workflows/ci.yml` 的 `docs` job 增加 `issueform-check` 步骤。
+- 上游 PR：`ximeiorg/XimeYao#32`（`tiengming:fix/issue-form-bug-template` @ `9b6bcd7` → `main`），2026-11-13 开、CI 双绿后**已合并为 `f1f18e3`**。
+
+### 5.4 验证
+
+| 平台 | 命令或步骤 | 实际输出 | 覆盖范围 |
+| --- | --- | --- | --- |
+| Windows 11 | `node scripts/issueform-check.mjs` | `issueform-check: 通过（4 个文件）` | 四份表单结构合法 |
+| Windows 11 | `node scripts/issueform-check.mjs target/tmp/broken`（内含合并前的旧 `bug_report.yml`） | `issueform-check: 失败（1 项）` + `bug_report.yml: 第 124 行：body 元素下出现非法键 placeholder` | **负向测试**：原缺陷可被机检捕获 |
+| Windows 11 | `node scripts/doccheck.mjs` / `node scripts/refcheck.mjs` / `node scripts/issueform-check.mjs` | `doccheck: 通过` / `refcheck: 通过（24 个文件）` / `issueform-check: 通过（4 个文件）` | 三机检全绿 |
+| GitHub 网页 | 打开 `ximeiorg/XimeYao` → Issues → New issue | **待用户确认**「缺陷反馈（Bug）」已出现 | 修复合入后的表单渲染 |
+
+## 6. 未验证项
+
+- 修复合入上游后，**「缺陷反馈（Bug）」是否真的出现在 New issue 页仍需用户在网页上确认**（机检只能证明结构合法，不能证明 GitHub 渲染）。
 - 模板在 GitHub 网页上的渲染已由用户截图确认（模板选择器可用）；**三个表单各自的必填项校验与下拉提交**尚未逐个走查。
 - 远程 issue 的行为根因（U-33 ~ U-35）尚未在本机复现，表中「处置」列写的是**假设方向**，不是已证结论。
 - #27 附带的两张截图（`github.com/user-attachments`）本轮未下载细看。
 
-## 6. 关联
+## 7. 关联
 
-- 决策：`D-012`。
+- 决策：`D-012`（模板与本地登记）、`D-013`（坏表单静默消失的根因与新增机检）。
 - 未决映射见 `PROGRESS.md` 未决表 U-33 ~ U-37。

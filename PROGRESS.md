@@ -24,6 +24,7 @@
 - 候选栏批次（几何+面板四项+三修复+二级菜单定位+品牌栏移除）与 U-10 日志治理、U-28 上屏通知已于 2026-11-11 全部实机确认通过。
 - 构建警告已清零（上游 aes-gcm deprecated ×2 改 `Nonce` copy 填充、TSF 链接 LNK4104 ×4 以 `#![allow(linker_messages)]` 说明缘由关闭）；上游 `xime-plugin/src/cipher.rs` 改动已随上游 PR #8 提交。
 - 2026-11-13 issue 模板与远程 issue 登记（`D-012`）：`.github/ISSUE_TEMPLATE/` 四份文件已写好（`bug_report.yml` / `feature_request.yml` / `question.yml` / `config.yml`），YAML 解析自检通过；远程 5 个 issue 已映射为 U-33~U-37 进未决表；决策与证据档案已写；**上游 PR `ximeiorg/XimeYao#31` 已合并（`cb111f4`，CI Docs + Build 双绿），三个表单已在仓库 Issues → New issue 页生效**（用户截图确认：功能建议 / 使用问题 / Blank issue / 两个 contact link 均出现）。
+- 2026-11-13 issue 表单缺失修复（`D-013`）：PR #31 合并后用户截图显示「缺陷反馈（Bug）」表单整份不出现且仓库无报错；根因是 `logs` 字段的 `placeholder:` 写在了 `attributes:` 外面（元素级），GitHub 整份表单校验后静默丢弃。已把 `placeholder:` 移回 `attributes:`，新增零依赖机检 `scripts/issueform-check.mjs` 并接入 CI `docs` job（负向测试能复现原缺陷）；**上游 PR `ximeiorg/XimeYao#32` 已合并为 `f1f18e3`（CI Docs + Build 双绿），待用户在 New issue 页确认「缺陷反馈（Bug）」出现**。
 
 ## 已完成
 
@@ -78,6 +79,7 @@
 | 2026-11-11 | U-29 词典操作失败文案修复（`dict_op_reason` 人话 + 引擎锁占用提示 + 备份失败补 error） | [2026-11-11-dict-error-messages.md](docs/verify/2026-11-11-dict-error-messages.md) | 机检通过（192 passed、0 warning）；**自动验证通过**（探测脚本六条命令：两处人话文案、三处 dict_paths 拒绝回归、成功路径正常） |
 | 2026-11-12 | 方案包安装/卸载失败与通知-UI 不统一（U-32 + U-31） | [2026-11-12-schema-package-install-notify.md](docs/verify/2026-11-12-schema-package-install-notify.md) | 机检通过（本仓 build/clippy 0 warning/test 全绿；上游 xime-setup-lib 62 passed、xime-config 44 passed + 2 预存失败）；**脚本探针 18 项断言全通过**；**上游 PR #7/#8/#9 已提交**；实机待用户按档案第 9 节六步复核 |
 | 2026-11-13 | 远程 issue 表单模板 + 远程 5 个 issue 本地登记（U-33~U-37） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) | 四份 YAML 解析通过；doccheck/refcheck 双绿；远程快照 issues=5 / prs=25；**模板网页渲染效果与 U-33~U-35 根因未验证** |
+| 2026-11-13 | 缺陷表单缺失根因与新增 issue 表单机检（`D-013`） | [2026-11-13-issue-templates-and-remote-issues.md](docs/verify/2026-11-13-issue-templates-and-remote-issues.md) | 根因证实（`placeholder` 位置错误 → GitHub 静默丢弃整份表单）；issueform-check 正/负向测试通过；doccheck/refcheck/issueform-check 三机检全绿；**上游 PR #32 已合并（`f1f18e3`，CI 双绿），渲染待用户人工确认** |
 
 ## 下一步
 
@@ -86,6 +88,6 @@
 - 2026-11-11 实机新遗留：U-29 词典失败文案（本轮已修，待实机）、U-30 模型下载 403 后空目录误判已下载（属上游 `xime-setup`，随上游 PR）。U-31（商店失败提示 4 秒消失）与 U-32（方案装不上/卸不掉）已在上游 `libximecore` 修好并提交 PR #7（待合并），实机复核待用户（`D-011`）。
 - U-10 剩余项：绘制重建与 506ms 离群值随后单独一轮；`DECISIONS.md` 2026-09-30 条「每键重读三份 yaml」的说法已过时（日志治理本身已实机通过并从未决表移除）。
 - 已开 PR：`ximeiorg/XimeYao#28`（`tiengming:feat/candidate-geometry-and-dict-msgs` → `main`，候选栏几何与面板四项 + U-10 日志治理 + U-28 上屏通知 + U-29 词典文案 + 版本 0.5.0；**按约定不含 docs/**，证据档案只留本地）**已于 2026-11-13 合并为 `3473fef`**；core 侧 `ximeiorg/libximecore#6` 已合并为 `04d6ca9`，等 CI 转绿后把 #26 转 ready；本轮又提交 core 侧 `ximeiorg/libximecore#7`（方案包 id 归一化 + 通知/UI 同源）、`#8`（aes-gcm 弃用）、`#9`（clipboard-page 门控修复无 feature 编译失败），三者均待上游合并。上游同步同理走 PR（本机账号对 `ximeiorg` 无 push 权限）。
-- 本轮待办：`ximeiorg/XimeYao#31` 已合并，issue 表单模板已生效；剩余：到仓库「Issues → New issue」页人工确认三个表单的**必填项校验**与下拉可提交（用户已确认模板选择器渲染正常）；再按 U-33→U-34→U-35 顺序在远程 issue 下追问缺项并本机取证。
+- 本轮待办：`ximeiorg/XimeYao#31` 已合并，issue 表单模板已生效；**PR #32（缺陷表单修复 + issueform-check）已合并为 `f1f18e3`，请到仓库「Issues → New issue」页确认「缺陷反馈（Bug）」已出现**，再逐个走查三个表单的必填项校验与下拉可提交；然后按 U-33→U-34→U-35 顺序在远程 issue 下追问缺项并本机取证。
 - P3b 收尾（暂缓：按要求不推远程）：把 libximecore 的 `b222de2` 推到 `ximeiorg/libximecore` 后再钉 `rev`，并用真实模型包走一次下载。
 - 本机构建先设 `CC=CXX=clang-cl` 与 LLVM `PATH`，再跑 `cargo build --quiet`；P2P 实机步骤见 [2026-11-10-clipboard-p2p-host.md](docs/verify/2026-11-10-clipboard-p2p-host.md) 末节。
